@@ -251,38 +251,63 @@ class MetadataInjector:
             return True
     
     def _update_photo_exif_piexif(self, photo_path: str, datetime_str: str) -> bool:
-        """Update EXIF using piexif library."""
+        """Update EXIF using piexif library and save via Pillow to a temp file."""
         try:
             exif_dict = piexif.load(photo_path)
-            
-            # Update DateTimeOriginal (EXIF tag 0x9003)
-            exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = datetime_str.encode()
-            
-            # Update DateTime (tag 0x0132)
-            exif_dict["0th"][piexif.ImageIFD.DateTime] = datetime_str.encode()
-            
+
+            # Ensure Exif and 0th exist
+            if "Exif" not in exif_dict:
+                exif_dict["Exif"] = {}
+            if "0th" not in exif_dict:
+                exif_dict["0th"] = {}
+
+            # Update DateTimeOriginal (EXIF tag 0x9003 / 36867)
+            exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = datetime_str.encode('utf-8')
+            # Update DateTime (tag 0x0132 / 306)
+            exif_dict["0th"][piexif.ImageIFD.DateTime] = datetime_str.encode('utf-8')
+
             exif_bytes = piexif.dump(exif_dict)
-            
-            # Create temporary file
+
+            # Save via Pillow to a temp file with exif bytes
+            image = Image.open(photo_path)
             temp_path = photo_path + '.tmp'
-            piexif.insert(exif_bytes, photo_path, temp_path)
-            
-            # Replace original
+            image.save(temp_path, format=image.format, exif=exif_bytes)
             shutil.move(temp_path, photo_path)
             logger.debug(f"Updated EXIF (piexif) for {photo_path}: {datetime_str}")
             return True
         except Exception as e:
             logger.debug(f"piexif update failed for {photo_path}, trying Pillow: {str(e)}")
             return False
-    
+
+    def _update_photo_exif_pillow(self, photo_path: str, datetime_str: str) -> bool:
+        """Fallback EXIF update using Pillow's getexif()/tobytes() when piexif is not available."""
+        try:
+            image = Image.open(photo_path)
+            exif = image.getexif()
+            # Exif tag numbers: 36867 = DateTimeOriginal, 306 = DateTime
+            exif[36867] = datetime_str
+            exif[306] = datetime_str
+            temp_path = photo_path + '.tmp'
+            image.save(temp_path, format=image.format, exif=exif.tobytes())
+            shutil.move(temp_path, photo_path)
+            logger.debug(f"Updated EXIF (Pillow) for {photo_path}: {datetime_str}")
+            return True
+        except Exception as e:
+            logger.debug(f"Pillow EXIF update failed for {photo_path}: {e}")
+            return False
+
     def _update_photo_exif_standard(self, photo_path: str, datetime_str: str) -> bool:
-        """Update EXIF for JPEG/TIFF files using piexif."""
+        """Update EXIF for JPEG/TIFF files using piexif when available, falling back to Pillow."""
         try:
             # Try piexif first (more reliable for EXIF)
             if piexif:
-                return self._update_photo_exif_piexif(photo_path, datetime_str)
-            else:
-                return self._update_photo_exif_pillow(photo_path, datetime_str)
+                success = self._update_photo_exif_piexif(photo_path, datetime_str)
+                if success:
+                    return True
+                # fall through to Pillow fallback if piexif approach failed
+
+            # Try Pillow fallback
+            return self._update_photo_exif_pillow(photo_path, datetime_str)
         except Exception as e:
             error_msg = f"Failed to update EXIF for {photo_path}: {e}"
             logger.error(error_msg)
@@ -331,36 +356,33 @@ class MetadataInjector:
     def _update_photo_exif_heic(self, photo_path: str, datetime_str: str) -> bool:
         """Update HEIC file metadata."""
         try:
-            if HAS_HEIF_SUPPORT:
-                # Try using pillow-heif for HEIC support
-                image = Image.open(photo_path)
-                
-                # Convert datetime to EXIF format
-                dt_obj = datetime.strptime(datetime_str, '%Y:%m:%d %H:%M:%S')
-                exif_datetime = dt_obj.strftime('%Y:%m:%d %H:%M:%S')
-                
-                # Create basic EXIF data
-                exif_dict = {
-                    piexif.ExifIFD.DateTimeOriginal: exif_datetime.encode(),
-                    piexif.ExifIFD.DateTimeDigitized: exif_datetime.encode()
-                }
-                
+            if not HAS_HEIF_SUPPORT:
+                logger.debug(f"HEIC support not available for {photo_path}, copying without metadata update")
+                return True  # Not an error, just unsupported
+
+            # Use Pillow (via pillow-heif) to open and save HEIC with EXIF if piexif is available
+            image = Image.open(photo_path)
+
+            if piexif:
+                # Build minimal EXIF structure
+                exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+                exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = datetime_str.encode('utf-8')
+                exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = datetime_str.encode('utf-8')
+                exif_dict["0th"][piexif.ImageIFD.DateTime] = datetime_str.encode('utf-8')
                 exif_bytes = piexif.dump(exif_dict)
-                
-                # Save with EXIF
+
                 temp_path = photo_path + '.tmp.heic'
-                image.save(temp_path, 'HEIC', exif=exif_bytes)
-                
+                image.save(temp_path, format='HEIC', exif=exif_bytes)
                 shutil.move(temp_path, photo_path)
                 logger.debug(f"Updated HEIC EXIF for {photo_path}: {datetime_str}")
                 return True
             else:
-                logger.debug(f"HEIC support not available for {photo_path}, copying without metadata update")
-                return True  # Not an error, just unsupported
-                
+                logger.debug(f"piexif not available; cannot write EXIF to HEIC for {photo_path}")
+                return True
+
         except Exception as e:
             logger.debug(f"HEIC metadata update failed for {photo_path}: {e}")
-            return True  # Don't count as error
+            return False
     
     def _update_photo_exif_gif(self, photo_path: str, datetime_str: str) -> bool:
         """Update GIF file with comment metadata."""
