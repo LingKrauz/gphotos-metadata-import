@@ -10,13 +10,18 @@ A Python utility that injects photo taken timestamps from Google Photos suppleme
 ✅ **Photo formats**:
 - JPEG/TIFF: EXIF DateTimeOriginal and DateTime tags
 - PNG: Text chunks (DateTimeOriginal, CreationTime, GooglePhotosTaken)
+- WebP: EXIF DateTimeOriginal and DateTime tags
 - HEIC: EXIF metadata (with pillow-heif)
 - GIF: Comment field with date/time
+- BMP: Copied without metadata (no standard support)
 ✅ **Video support**: Updates container creation_time metadata using ffmpeg  
 ✅ **Graceful degradation**: Continues processing if optional tools (ffmpeg, pillow-heif) are unavailable  
 ✅ **Unknown timestamps**: Separates files with missing timestamps into an "Unknown Timestamp" folder  
 ✅ **Comprehensive logging**: Detailed logs with success/error breakdown by format  
 ✅ **Recursive processing**: Handles nested folder structures  
+✅ **Dry-run mode**: Preview what would be processed without modifying anything  
+✅ **Resume support**: `--skip-existing` to skip already-processed files  
+✅ **Progress reporting**: Periodic progress updates during processing  
 
 ## Installation
 
@@ -67,6 +72,21 @@ python inject_google_photos_metadata.py \
   --log-file "/path/to/logfile.log"
 ```
 
+### Dry run (preview without changes)
+```bash
+python inject_google_photos_metadata.py --dry-run
+```
+
+### Resume an interrupted run
+```bash
+python inject_google_photos_metadata.py --skip-existing
+```
+
+### Verbose output (DEBUG level on console)
+```bash
+python inject_google_photos_metadata.py -v
+```
+
 ### Help
 ```bash
 python inject_google_photos_metadata.py --help
@@ -106,7 +126,7 @@ Output structure:
 
 ## Metadata Fields Updated
 
-### JPEG/TIFF Photos
+### JPEG/TIFF/WebP Photos
 - **EXIF DateTimeOriginal** (tag 0x9003): When the photo was taken
 - **EXIF DateTime** (tag 0x0132): Secondary timestamp for compatibility
 
@@ -174,3 +194,13 @@ Install these dependencies for full functionality:
 ```bash
 pip install piexif pillow-heif
 ```
+
+## Testing
+
+Run the test suite with pytest:
+```bash
+pip install pytest
+python -m pytest tests/ -v
+```
+
+Tests cover metadata parsing, format-specific handlers (JPEG, PNG, GIF, WebP), extension constants, and end-to-end integration scenarios including dry-run and skip-existing modes.

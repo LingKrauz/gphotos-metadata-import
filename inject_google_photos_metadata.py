@@ -13,6 +13,7 @@ from typing import Optional, Tuple, Dict, List
 try:
     from PIL import Image
     from PIL.ExifTags import TAGS
+    from PIL import PngImagePlugin
 except ImportError:
     print("ERROR: Pillow not installed. Run: pip install Pillow")
     sys.exit(1)
@@ -47,13 +48,6 @@ except Exception:
     HAS_FFMPEG = False
     FFMPEG_CMD = None
 
-# Try to import additional libraries for extended format support
-try:
-    import pyheif
-    HAS_PYHEIF = True
-except ImportError:
-    HAS_PYHEIF = False
-
 try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
@@ -61,9 +55,18 @@ try:
 except ImportError:
     HAS_HEIF_SUPPORT = False
 
+# Supported file extension sets
+EXIF_IMAGE_EXTENSIONS = frozenset(['.jpg', '.jpeg', '.tiff', '.tif', '.webp'])
+PNG_EXTENSIONS = frozenset(['.png'])
+HEIC_EXTENSIONS = frozenset(['.heic'])
+GIF_EXTENSIONS = frozenset(['.gif'])
+COPY_ONLY_IMAGE_EXTENSIONS = frozenset(['.bmp'])
+IMAGE_EXTENSIONS = EXIF_IMAGE_EXTENSIONS | PNG_EXTENSIONS | HEIC_EXTENSIONS | GIF_EXTENSIONS | COPY_ONLY_IMAGE_EXTENSIONS
+VIDEO_EXTENSIONS = frozenset(['.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.webm'])
+
 
 # Setup logging
-def setup_logging(log_file: str) -> logging.Logger:
+def setup_logging(log_file: str, verbose: bool = False) -> logging.Logger:
     """Configure logging to both file and console."""
     log_dir = os.path.dirname(log_file)
     if log_dir:
@@ -80,7 +83,7 @@ def setup_logging(log_file: str) -> logging.Logger:
     
     # Console handler
     ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
+    ch.setLevel(logging.DEBUG if verbose else logging.INFO)
     
     # Formatter
     formatter = logging.Formatter(
@@ -115,6 +118,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help='Path to the log file. Defaults to <output-root>/metadata_injection.log.'
     )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        default=False,
+        help='Preview what would be processed without copying or modifying any files.'
+    )
+    parser.add_argument(
+        '--skip-existing',
+        action='store_true',
+        default=False,
+        help='Skip files that already exist in the output directory (useful for resuming).'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        default=False,
+        help='Show DEBUG-level output on the console.'
+    )
     return parser.parse_args()
 
 
@@ -124,15 +145,19 @@ logger = logging.getLogger(__name__)
 class MetadataInjector:
     """Handles injection of Google Photos metadata into actual media files."""
     
-    def __init__(self, input_root: str, output_root: str, log_file: str):
+    def __init__(self, input_root: str, output_root: str, log_file: str,
+                 dry_run: bool = False, skip_existing: bool = False):
         self.input_root = input_root
         self.output_root = output_root
         self.log_file = log_file
+        self.dry_run = dry_run
+        self.skip_existing = skip_existing
         self.stats = {
             'processed': 0,
             'skipped': 0,
+            'skipped_existing': 0,  # Files skipped because they already exist
             'errors': 0,
-            'photos_exif': 0,      # JPEG/TIFF with EXIF updated
+            'photos_exif': 0,      # JPEG/TIFF/WebP with EXIF updated
             'photos_png': 0,       # PNG with text metadata
             'photos_heic': 0,      # HEIC with EXIF (if supported)
             'photos_gif': 0,       # GIF with comment metadata
@@ -234,24 +259,32 @@ class MetadataInjector:
         
         # Handle different image formats
         if ext in ['.jpg', '.jpeg', '.tiff', '.tif']:
-            # Standard EXIF-supporting formats
+            return self._update_photo_exif_standard(photo_path, datetime_str)
+        elif ext == '.webp':
             return self._update_photo_exif_standard(photo_path, datetime_str)
         elif ext == '.heic':
-            # HEIC format - try HEIF support if available
             return self._update_photo_exif_heic(photo_path, datetime_str)
         elif ext == '.png':
-            # PNG format - use text chunks for metadata
             return self._update_photo_exif_png(photo_path, datetime_str)
         elif ext == '.gif':
-            # GIF format - limited metadata support
             return self._update_photo_exif_gif(photo_path, datetime_str)
         else:
-            # Unknown format
-            logger.debug(f"Unknown image format {ext}, skipping metadata update: {photo_path}")
+            # Formats like BMP have no standard metadata support
+            logger.debug(f"No metadata handler for {ext}, skipping metadata update: {photo_path}")
             return True
     
+    @staticmethod
+    def _safe_remove(path: str):
+        """Remove a file if it exists, ignoring errors."""
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
     def _update_photo_exif_piexif(self, photo_path: str, datetime_str: str) -> bool:
         """Update EXIF using piexif library and save via Pillow to a temp file."""
+        temp_path = photo_path + '.tmp'
         try:
             exif_dict = piexif.load(photo_path)
 
@@ -270,29 +303,30 @@ class MetadataInjector:
 
             # Save via Pillow to a temp file with exif bytes
             image = Image.open(photo_path)
-            temp_path = photo_path + '.tmp'
             image.save(temp_path, format=image.format, exif=exif_bytes)
             shutil.move(temp_path, photo_path)
             logger.debug(f"Updated EXIF (piexif) for {photo_path}: {datetime_str}")
             return True
         except Exception as e:
+            self._safe_remove(temp_path)
             logger.debug(f"piexif update failed for {photo_path}, trying Pillow: {str(e)}")
             return False
 
     def _update_photo_exif_pillow(self, photo_path: str, datetime_str: str) -> bool:
         """Fallback EXIF update using Pillow's getexif()/tobytes() when piexif is not available."""
+        temp_path = photo_path + '.tmp'
         try:
             image = Image.open(photo_path)
             exif = image.getexif()
             # Exif tag numbers: 36867 = DateTimeOriginal, 306 = DateTime
             exif[36867] = datetime_str
             exif[306] = datetime_str
-            temp_path = photo_path + '.tmp'
             image.save(temp_path, format=image.format, exif=exif.tobytes())
             shutil.move(temp_path, photo_path)
             logger.debug(f"Updated EXIF (Pillow) for {photo_path}: {datetime_str}")
             return True
         except Exception as e:
+            self._safe_remove(temp_path)
             logger.debug(f"Pillow EXIF update failed for {photo_path}: {e}")
             return False
 
@@ -316,36 +350,30 @@ class MetadataInjector:
     
     def _update_photo_exif_png(self, photo_path: str, datetime_str: str) -> bool:
         """Update PNG file with date/time in text chunks."""
+        temp_path = photo_path + '.tmp'
         try:
-            # Open the PNG image
             image = Image.open(photo_path)
             
-            # PNG doesn't support EXIF, but we can add text metadata
-            # Create metadata dictionary
             metadata = {
                 'DateTimeOriginal': datetime_str,
                 'CreationTime': datetime_str,
                 'GooglePhotosTaken': datetime_str
             }
             
-            # Save with metadata in text chunks
-            temp_path = photo_path + '.tmp'
             image.save(temp_path, 'PNG', 
                       pnginfo=self._create_png_metadata(metadata))
-            
-            # Replace original
             shutil.move(temp_path, photo_path)
             
             logger.debug(f"Updated PNG metadata for {photo_path}: {datetime_str}")
             return True
             
         except Exception as e:
+            self._safe_remove(temp_path)
             logger.debug(f"PNG metadata update failed for {photo_path}: {e}")
             return False
     
-    def _create_png_metadata(self, metadata_dict: Dict[str, str]):
+    def _create_png_metadata(self, metadata_dict: Dict[str, str]) -> PngImagePlugin.PngInfo:
         """Create PNG text chunks from metadata dictionary."""
-        from PIL import PngImagePlugin
         png_info = PngImagePlugin.PngInfo()
         
         for key, value in metadata_dict.items():
@@ -360,11 +388,9 @@ class MetadataInjector:
                 logger.debug(f"HEIC support not available for {photo_path}, copying without metadata update")
                 return True  # Not an error, just unsupported
 
-            # Use Pillow (via pillow-heif) to open and save HEIC with EXIF if piexif is available
             image = Image.open(photo_path)
 
             if piexif:
-                # Build minimal EXIF structure
                 exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
                 exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = datetime_str.encode('utf-8')
                 exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = datetime_str.encode('utf-8')
@@ -372,8 +398,12 @@ class MetadataInjector:
                 exif_bytes = piexif.dump(exif_dict)
 
                 temp_path = photo_path + '.tmp.heic'
-                image.save(temp_path, format='HEIC', exif=exif_bytes)
-                shutil.move(temp_path, photo_path)
+                try:
+                    image.save(temp_path, format='HEIC', exif=exif_bytes)
+                    shutil.move(temp_path, photo_path)
+                except Exception:
+                    self._safe_remove(temp_path)
+                    raise
                 logger.debug(f"Updated HEIC EXIF for {photo_path}: {datetime_str}")
                 return True
             else:
@@ -386,30 +416,29 @@ class MetadataInjector:
     
     def _update_photo_exif_gif(self, photo_path: str, datetime_str: str) -> bool:
         """Update GIF file with comment metadata."""
+        temp_path = photo_path + '.tmp'
         try:
             image = Image.open(photo_path)
-            
-            # GIF has limited metadata support, but we can add a comment
             comment_text = f"DateTimeOriginal: {datetime_str}\nGooglePhotosTaken: {datetime_str}"
             
-            # Save with comment
-            temp_path = photo_path + '.tmp'
             image.save(temp_path, 'GIF', comment=comment_text.encode('utf-8'))
-            
             shutil.move(temp_path, photo_path)
             logger.debug(f"Updated GIF comment for {photo_path}: {datetime_str}")
             return True
             
         except Exception as e:
+            self._safe_remove(temp_path)
             logger.debug(f"GIF metadata update failed for {photo_path}: {e}")
             return False
     
-    def update_video_metadata(self, video_path: str, datetime_str: str) -> bool:
-        """Update creation time metadata in a video file."""
+    def update_video_metadata(self, video_path: str, datetime_str: str) -> Optional[bool]:
+        """Update creation time metadata in a video file.
+        
+        Returns True on success, False on error, None if skipped (ffmpeg unavailable).
+        """
         if not HAS_FFMPEG or not FFMPEG_CMD:
             logger.warning(f"ffmpeg not found, skipping video metadata for {video_path}")
-            self.stats['skipped'] += 1
-            return False
+            return None
         
         try:
             # Convert EXIF datetime to ISO 8601 format for ffmpeg
@@ -417,8 +446,9 @@ class MetadataInjector:
             dt_obj = datetime.strptime(datetime_str, '%Y:%m:%d %H:%M:%S')
             iso_datetime = dt_obj.strftime('%Y-%m-%dT%H:%M:%SZ')
             
-            # Create temporary output file
-            temp_output = video_path + '.tmp.mp4'
+            # Create temporary output file preserving original extension
+            ext = os.path.splitext(video_path)[1]
+            temp_output = video_path + '.tmp' + ext
             
             # Use ffmpeg to update metadata
             cmd = [
@@ -455,72 +485,67 @@ class MetadataInjector:
             self.errors.append(error_msg)
             return False
     
+    # Maps extension categories to stat keys and display names
+    _IMAGE_STAT_MAP = {
+        'exif': ('photos_exif', 'JPEG/TIFF/WebP'),
+        'png': ('photos_png', 'PNG'),
+        'heic': ('photos_heic', 'HEIC'),
+        'gif': ('photos_gif', 'GIF'),
+    }
+    
+    def _get_image_category(self, ext: str) -> Optional[str]:
+        """Return the image category key for a file extension, or None for copy-only/unknown."""
+        if ext in EXIF_IMAGE_EXTENSIONS:
+            return 'exif'
+        elif ext in PNG_EXTENSIONS:
+            return 'png'
+        elif ext in HEIC_EXTENSIONS:
+            return 'heic'
+        elif ext in GIF_EXTENSIONS:
+            return 'gif'
+        return None
+
     def process_media_file(self, media_path: str, datetime_str: str, output_path: str) -> bool:
         """Process a media file: copy it and update its metadata based on type."""
         try:
-            # Create output directory if needed
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            
-            # Copy file to output location
             shutil.copy2(media_path, output_path)
             
-            # Determine file type and update metadata
             ext = os.path.splitext(output_path)[1].lower()
-            is_video = ext in ['.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.webm']
-            is_image = ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.heic', '.webp']
             
-            if is_video:
-                success = self.update_video_metadata(output_path, datetime_str)
-                if success:
+            if ext in VIDEO_EXTENSIONS:
+                result = self.update_video_metadata(output_path, datetime_str)
+                if result is True:
                     self.stats['videos'] += 1
+                    return True
+                elif result is None:
+                    self.stats['copied_no_metadata'] += 1
+                    return True
                 else:
                     error_msg = f"Failed to update video metadata for {output_path}"
                     logger.warning(f"Metadata update failed: {output_path} (video)")
                     self.errors.append(error_msg)
-            elif is_image:
-                ext = os.path.splitext(output_path)[1].lower()
-                if ext in ['.jpg', '.jpeg', '.tiff', '.tif']:
-                    success = self.update_photo_exif(output_path, datetime_str)
-                    if success:
-                        self.stats['photos_exif'] += 1
-                    else:
-                        error_msg = f"Failed to update EXIF metadata for {output_path}"
-                        logger.warning(f"Metadata update failed: {output_path} (JPEG/TIFF)")
-                        self.errors.append(error_msg)
-                elif ext == '.png':
-                    success = self._update_photo_exif_png(output_path, datetime_str)
-                    if success:
-                        self.stats['photos_png'] += 1
-                    else:
-                        error_msg = f"Failed to update PNG metadata for {output_path}"
-                        logger.warning(f"Metadata update failed: {output_path} (PNG)")
-                        self.errors.append(error_msg)
-                elif ext == '.heic':
-                    success = self._update_photo_exif_heic(output_path, datetime_str)
-                    if success:
-                        self.stats['photos_heic'] += 1
-                    else:
-                        error_msg = f"Failed to update HEIC metadata for {output_path}"
-                        logger.warning(f"Metadata update failed: {output_path} (HEIC)")
-                        self.errors.append(error_msg)
-                elif ext == '.gif':
-                    success = self._update_photo_exif_gif(output_path, datetime_str)
-                    if success:
-                        self.stats['photos_gif'] += 1
-                    else:
-                        error_msg = f"Failed to update GIF metadata for {output_path}"
-                        logger.warning(f"Metadata update failed: {output_path} (GIF)")
-                        self.errors.append(error_msg)
-                else:
-                    # Unknown image format
-                    logger.debug(f"Unknown image format {ext}, copying without metadata update: {output_path}")
-                    success = True
-                    self.stats['copied_no_metadata'] += 1
-            else:
-                logger.warning(f"Unknown file type for {output_path}, copied without metadata update")
-                success = True
+                    return False
             
-            return success
+            if ext in IMAGE_EXTENSIONS:
+                category = self._get_image_category(ext)
+                if category is None:
+                    # Copy-only formats (e.g. BMP) — no metadata handler
+                    self.stats['copied_no_metadata'] += 1
+                    return True
+                
+                stat_key, display_name = self._IMAGE_STAT_MAP[category]
+                success = self.update_photo_exif(output_path, datetime_str)
+                if success:
+                    self.stats[stat_key] += 1
+                else:
+                    error_msg = f"Failed to update {display_name} metadata for {output_path}"
+                    logger.warning(f"Metadata update failed: {output_path} ({display_name})")
+                    self.errors.append(error_msg)
+                return success
+            
+            logger.warning(f"Unknown file type for {output_path}, copied without metadata update")
+            return True
         
         except Exception as e:
             error_msg = f"Failed to process media file {media_path}: {e}"
@@ -547,16 +572,25 @@ class MetadataInjector:
         
         # Extract photo taken time
         datetime_str = self.get_photo_taken_time(metadata)
+        rel_path = os.path.relpath(media_file, self.input_root)
+        
         if not datetime_str:
             # Copy file to Unknown Timestamp subdirectory
-            rel_path = os.path.relpath(media_file, self.input_root)
             unknown_dir = os.path.join(self.output_root, "Unknown Timestamp")
             output_path = os.path.join(unknown_dir, rel_path)
             
+            if self.dry_run:
+                logger.info(f"[DRY RUN] Would copy to Unknown Timestamp: {rel_path}")
+                self.stats['unknown_timestamp'] += 1
+                return True
+            
+            if self.skip_existing and os.path.exists(output_path):
+                logger.debug(f"Skipping (already exists): {output_path}")
+                self.stats['skipped_existing'] += 1
+                return True
+            
             try:
-                # Create output directory if needed
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                # Copy file to unknown timestamp folder
                 shutil.copy2(media_file, output_path)
                 self.stats['unknown_timestamp'] += 1
                 logger.info(f"Copied to Unknown Timestamp: {rel_path}")
@@ -569,8 +603,19 @@ class MetadataInjector:
                 return False
         
         # Calculate output path (preserve directory structure relative to input root)
-        rel_path = os.path.relpath(media_file, self.input_root)
         output_path = os.path.join(self.output_root, rel_path)
+        
+        if self.skip_existing and os.path.exists(output_path):
+            logger.debug(f"Skipping (already exists): {output_path}")
+            self.stats['skipped_existing'] += 1
+            return True
+        
+        if self.dry_run:
+            ext = os.path.splitext(media_file)[1].lower()
+            action = "update metadata" if ext in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS else "copy"
+            logger.info(f"[DRY RUN] Would {action}: {rel_path} (timestamp: {datetime_str})")
+            self.stats['processed'] += 1
+            return True
         
         # Process the media file
         if self.process_media_file(media_file, datetime_str, output_path):
@@ -583,14 +628,17 @@ class MetadataInjector:
     
     def run(self) -> bool:
         """Run the metadata injection process on all metadata files."""
+        if self.dry_run:
+            logger.info("=" * 40 + " DRY RUN " + "=" * 40)
         logger.info(f"Starting metadata injection from {self.input_root}")
         logger.info(f"Output will be saved to {self.output_root}")
+        if self.skip_existing:
+            logger.info("Skip-existing mode: files already in output will be skipped")
         
         if not os.path.exists(self.input_root):
             logger.error(f"Input directory not found: {self.input_root}")
             return False
         
-        # Check for ffmpeg
         if HAS_FFMPEG and FFMPEG_CMD:
             logger.info(f"ffmpeg found at: {FFMPEG_CMD}")
             logger.info("Video metadata will be updated")
@@ -599,33 +647,39 @@ class MetadataInjector:
             logger.info("To enable video support, install ffmpeg from https://ffmpeg.org/download.html")
         
         logger.info("Supported image formats:")
-        logger.info("  JPEG/TIFF: EXIF metadata (DateTimeOriginal)")
+        logger.info("  JPEG/TIFF/WebP: EXIF metadata (DateTimeOriginal)")
         logger.info("  PNG: Text chunks with date/time metadata")
         logger.info("  HEIC: EXIF metadata (with pillow-heif)")
         logger.info("  GIF: Comment field with date/time metadata")
         
-        # Find all metadata files
         metadata_files = self.find_all_metadata_files()
         if not metadata_files:
             logger.warning("No metadata files found!")
             return False
         
-        # Process each metadata file
-        for i, metadata_file in enumerate(metadata_files, 1):
-            logger.debug(f"Processing {i}/{len(metadata_files)}: {metadata_file}")
-            self.process_metadata_file(metadata_file)
+        total = len(metadata_files)
+        progress_interval = max(1, total // 10)  # Log progress every ~10%
         
-        # Print summary
+        for i, metadata_file in enumerate(metadata_files, 1):
+            logger.debug(f"Processing {i}/{total}: {metadata_file}")
+            self.process_metadata_file(metadata_file)
+            
+            if i % progress_interval == 0 or i == total:
+                pct = (i * 100) // total
+                logger.info(f"Progress: {i}/{total} ({pct}%)")
+        
         self.print_summary()
         return True
     
     def print_summary(self):
         """Print processing summary."""
         logger.info("\n" + "="*60)
-        logger.info("PROCESSING COMPLETE")
+        logger.info("PROCESSING COMPLETE" + (" (DRY RUN)" if self.dry_run else ""))
         logger.info("="*60)
         logger.info(f"Processed:     {self.stats['processed']}")
         logger.info(f"Skipped:       {self.stats['skipped']}")
+        if self.stats['skipped_existing']:
+            logger.info(f"Skipped (existing): {self.stats['skipped_existing']}")
         logger.info(f"Errors:        {self.stats['errors']}")
         logger.info(f"Photos (EXIF): {self.stats['photos_exif']}")
         logger.info(f"Photos (PNG):  {self.stats['photos_png']}")
@@ -655,8 +709,12 @@ def main():
         )
         log_file = args.log_file if args.log_file else os.path.join(output_root, 'metadata_injection.log')
 
-        logger = setup_logging(log_file)
-        injector = MetadataInjector(input_root, output_root, log_file)
+        logger = setup_logging(log_file, verbose=args.verbose)
+        injector = MetadataInjector(
+            input_root, output_root, log_file,
+            dry_run=args.dry_run,
+            skip_existing=args.skip_existing,
+        )
         success = injector.run()
         sys.exit(0 if success else 1)
     except Exception as e:

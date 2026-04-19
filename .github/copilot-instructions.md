@@ -40,10 +40,11 @@ The script automatically:
 - Also tolerates JSON typo variant: `.supplemental-metada.json`
 
 **Format-Specific Handlers**
-- JPEG/TIFF: Standard EXIF tags via `piexif` library (primary) or Pillow fallback
+- JPEG/TIFF/WebP: Standard EXIF tags via `piexif` library (primary) or Pillow fallback
 - PNG: Text chunks (DateTimeOriginal, CreationTime, GooglePhotosTaken)
 - HEIC: EXIF via `pillow-heif` (if available; auto-detects)
 - GIF: Comment metadata
+- BMP: Copied without metadata (no standard support)
 - Videos: Container metadata via `ffmpeg` (if available; auto-detects)
 
 **External Tool Detection**
