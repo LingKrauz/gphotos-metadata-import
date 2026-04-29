@@ -399,7 +399,7 @@ class MetadataInjector:
 
                 temp_path = photo_path + '.tmp.heic'
                 try:
-                    image.save(temp_path, format='HEIC', exif=exif_bytes)
+                    image.save(temp_path, format='HEIF', exif=exif_bytes)
                     shutil.move(temp_path, photo_path)
                 except Exception:
                     self._safe_remove(temp_path)
