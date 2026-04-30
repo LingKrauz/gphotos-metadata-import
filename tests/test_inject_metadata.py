@@ -77,6 +77,123 @@ class TestFindMatchingMediaFile:
         result = injector.find_matching_media_file(json_path, str(input_dir))
         assert result is None
 
+    def test_truncated_meta_variant_match(self, tmp_dirs, make_jpeg):
+        """Test .supplemental-meta.json (shortest named truncation) matches the media file."""
+        input_dir, output_dir = tmp_dirs
+        make_jpeg(input_dir, "photo.jpg")
+        json_path = os.path.join(str(input_dir), "photo.jpg.supplemental-meta.json")
+        import json as _json
+        with open(json_path, "w") as f:
+            _json.dump({"photoTakenTime": {"timestamp": "1609459200"}}, f)
+
+        injector = self._make_injector(input_dir, output_dir)
+        result = injector.find_matching_media_file(json_path, str(input_dir))
+        assert result is not None
+        assert os.path.basename(result) == "photo.jpg"
+
+    def test_extremely_truncated_supple_variant_match(self, tmp_dirs, make_jpeg):
+        """Test .supple.json (maximum truncation at 51-char limit) matches the media file."""
+        input_dir, output_dir = tmp_dirs
+        make_jpeg(input_dir, "photo.jpg")
+        json_path = os.path.join(str(input_dir), "photo.jpg.supple.json")
+        import json as _json
+        with open(json_path, "w") as f:
+            _json.dump({"photoTakenTime": {"timestamp": "1609459200"}}, f)
+
+        injector = self._make_injector(input_dir, output_dir)
+        result = injector.find_matching_media_file(json_path, str(input_dir))
+        assert result is not None
+        assert os.path.basename(result) == "photo.jpg"
+
+    def test_duplicate_number_with_truncated_variant(self, tmp_dirs, make_jpeg):
+        """Test photo(1).jpg matched by photo.jpg.supplemental-meta(1).json."""
+        input_dir, output_dir = tmp_dirs
+        make_jpeg(input_dir, "photo(1).jpg")
+        json_path = os.path.join(str(input_dir), "photo.jpg.supplemental-meta(1).json")
+        import json as _json
+        with open(json_path, "w") as f:
+            _json.dump({"photoTakenTime": {"timestamp": "1609459200"}}, f)
+
+        injector = self._make_injector(input_dir, output_dir)
+        result = injector.find_matching_media_file(json_path, str(input_dir))
+        assert result is not None
+        assert os.path.basename(result) == "photo(1).jpg"
+
+    def test_number_in_media_filename_not_treated_as_duplicate(self, tmp_dirs, make_jpeg):
+        """Test that (1) in the media filename itself is not treated as a duplicate number."""
+        input_dir, output_dir = tmp_dirs
+        make_jpeg(input_dir, "photo(1).jpg")
+        # JSON suffix has no (N) — the (1) is part of the media filename
+        json_path = os.path.join(str(input_dir), "photo(1).jpg.supplemental-me.json")
+        import json as _json
+        with open(json_path, "w") as f:
+            _json.dump({"photoTakenTime": {"timestamp": "1609459200"}}, f)
+
+        injector = self._make_injector(input_dir, output_dir)
+        result = injector.find_matching_media_file(json_path, str(input_dir))
+        assert result is not None
+        assert os.path.basename(result) == "photo(1).jpg"
+
+
+class TestFindAllMetadataFiles:
+    """Tests for MetadataInjector.find_all_metadata_files."""
+
+    def _make_injector(self, input_dir, output_dir):
+        log_file = os.path.join(str(output_dir), "test.log")
+        setup_logging(log_file)
+        return MetadataInjector(str(input_dir), str(output_dir), log_file)
+
+    def _write_json(self, path):
+        import json as _json
+        with open(path, "w") as f:
+            _json.dump({"photoTakenTime": {"timestamp": "1609459200"}}, f)
+
+    def test_finds_standard_json(self, tmp_dirs):
+        input_dir, output_dir = tmp_dirs
+        p = os.path.join(str(input_dir), "photo.jpg.supplemental-metadata.json")
+        self._write_json(p)
+        injector = self._make_injector(input_dir, output_dir)
+        found = injector.find_all_metadata_files()
+        assert any(os.path.basename(f) == "photo.jpg.supplemental-metadata.json" for f in found)
+
+    def test_finds_numbered_duplicate_json(self, tmp_dirs):
+        """supplemental-metadata(1).json must be discovered by the scanner."""
+        input_dir, output_dir = tmp_dirs
+        p = os.path.join(str(input_dir), "photo.jpg.supplemental-metadata(1).json")
+        self._write_json(p)
+        injector = self._make_injector(input_dir, output_dir)
+        found = injector.find_all_metadata_files()
+        assert any("supplemental-metadata(1).json" in f for f in found)
+
+    def test_finds_truncated_meta_variants(self, tmp_dirs):
+        """All supplemental-meta* truncation variants (down to .supple) must be discovered."""
+        input_dir, output_dir = tmp_dirs
+        variants = [
+            "a.jpg.supplemental-metadat.json",
+            "b.jpg.supplemental-metada.json",
+            "c.jpg.supplemental-metad.json",
+            "d.jpg.supplemental-meta.json",
+            "e.jpg.supplemental-met.json",
+            "f.jpg.supplemental-me.json",
+            "g.jpg.supplement.json",
+            "h.jpg.supple.json",
+        ]
+        for name in variants:
+            self._write_json(os.path.join(str(input_dir), name))
+        injector = self._make_injector(input_dir, output_dir)
+        found = {os.path.basename(f) for f in injector.find_all_metadata_files()}
+        for name in variants:
+            assert name in found, f"Expected {name} to be found"
+
+    def test_finds_numbered_truncated_variant(self, tmp_dirs):
+        """supplemental-meta(2).json must be discovered."""
+        input_dir, output_dir = tmp_dirs
+        p = os.path.join(str(input_dir), "photo.jpg.supplemental-meta(2).json")
+        self._write_json(p)
+        injector = self._make_injector(input_dir, output_dir)
+        found = injector.find_all_metadata_files()
+        assert any("supplemental-meta(2).json" in f for f in found)
+
 
 class TestGetPhotoTakenTime:
     """Tests for MetadataInjector.get_photo_taken_time."""

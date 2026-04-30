@@ -171,11 +171,15 @@ class MetadataInjector:
         """Recursively find all supplemental metadata JSON files."""
         metadata_files = []
         
+        # Google Takeout truncates the JSON filename to 51 characters total.
+        # For long media filenames this means the "supplemental-metadata" suffix
+        # can be cut as short as ".supple".  Match any JSON whose suffix begins
+        # with ".suppl" (the minimum unambiguous prefix of "supplemental") and
+        # optionally has a duplicate-number like (1) before ".json".
+        _json_pattern = re.compile(r'\.suppl[a-z-]*(?:\(\d+\))?\.json$', re.IGNORECASE)
         for root, dirs, files in os.walk(self.input_root):
             for file in files:
-                # Match both correct and typo variants
-                if file.endswith('.supplemental-metadata.json') or \
-                   file.endswith('.supplemental-metada.json'):
+                if _json_pattern.search(file):
                     metadata_files.append(os.path.join(root, file))
         
         logger.info(f"Found {len(metadata_files)} metadata files")
@@ -191,9 +195,11 @@ class MetadataInjector:
         """
         metadata_filename = os.path.basename(metadata_file)
         
-        # Extract base name and any duplicate number
-        # Pattern: BASENAME.supplemental-metadata(NUMBER).json or BASENAME.supplemental-metada(NUMBER).json
-        match = re.match(r'(.+?)\.(supplemental-metada|supplemental-metadata)(?:\((\d+)\))?\.json$', metadata_filename)
+        # Extract base name and any duplicate number.
+        # Google Takeout truncates the full JSON filename to 51 characters, so the
+        # "supplemental-metadata" suffix may appear as anything from the full
+        # ".supplemental-metadata" down to just ".supple".
+        match = re.match(r'(.+?)\.(suppl[a-z-]*)(?:\((\d+)\))?\.json$', metadata_filename, re.IGNORECASE)
         
         if not match:
             logger.warning(f"Could not parse metadata filename: {metadata_filename}")
@@ -201,16 +207,12 @@ class MetadataInjector:
         
         base_name = match.group(1)  # e.g., "photo.jpg" or "image.jpeg"
         duplicate_number = match.group(3)  # e.g., "20" or None
-        
-        # Try standard match first: base_name directly
-        direct_match = os.path.join(metadata_dir, base_name)
-        if os.path.exists(direct_match) and os.path.isfile(direct_match):
-            return direct_match
-        
-        # If we have a duplicate number, try matching with the number in the filename
+
+        # When a duplicate number is present, only look for the numbered variant
+        # (e.g., photo.jpg.supplemental-metadata(20).json → photo(20).jpg).
+        # Falling back to the direct base_name match would return the wrong file
+        # (the original photo.jpg, which has its own un-numbered JSON).
         if duplicate_number:
-            # Insert the number before the extension
-            # e.g., "photo.jpg" becomes "photo(20).jpg"
             parts = base_name.rsplit('.', 1)
             if len(parts) == 2:
                 name_part, ext = parts
@@ -218,7 +220,13 @@ class MetadataInjector:
                 numbered_match = os.path.join(metadata_dir, numbered_name)
                 if os.path.exists(numbered_match) and os.path.isfile(numbered_match):
                     return numbered_match
-        
+            return None
+
+        # Standard (non-duplicate) match: base_name directly
+        direct_match = os.path.join(metadata_dir, base_name)
+        if os.path.exists(direct_match) and os.path.isfile(direct_match):
+            return direct_match
+
         return None
     
     def read_metadata_json(self, json_file: str) -> Optional[Dict]:
@@ -553,42 +561,28 @@ class MetadataInjector:
             self.errors.append(error_msg)
             return False
     
-    def process_metadata_file(self, metadata_file: str) -> bool:
-        """Process a single metadata JSON file and update the corresponding media file."""
-        metadata_dir = os.path.dirname(metadata_file)
-        
-        # Find matching media file
-        media_file = self.find_matching_media_file(metadata_file, metadata_dir)
-        if not media_file:
-            logger.warning(f"No matching media file found for {metadata_file}")
-            self.stats['skipped'] += 1
-            return False
-        
-        # Read metadata
-        metadata = self.read_metadata_json(metadata_file)
-        if not metadata:
-            self.stats['skipped'] += 1
-            return False
-        
-        # Extract photo taken time
-        datetime_str = self.get_photo_taken_time(metadata)
+    def _dispatch_single_media(self, media_file: str, datetime_str: Optional[str]) -> bool:
+        """
+        Copy one media file to the output tree and inject its timestamp.
+        Handles dry-run, skip-existing, unknown-timestamp, and normal paths.
+        Returns True on success (including intentional skips).
+        """
         rel_path = os.path.relpath(media_file, self.input_root)
-        
+
         if not datetime_str:
-            # Copy file to Unknown Timestamp subdirectory
             unknown_dir = os.path.join(self.output_root, "Unknown Timestamp")
             output_path = os.path.join(unknown_dir, rel_path)
-            
+
             if self.dry_run:
                 logger.info(f"[DRY RUN] Would copy to Unknown Timestamp: {rel_path}")
                 self.stats['unknown_timestamp'] += 1
                 return True
-            
+
             if self.skip_existing and os.path.exists(output_path):
                 logger.debug(f"Skipping (already exists): {output_path}")
                 self.stats['skipped_existing'] += 1
                 return True
-            
+
             try:
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
                 shutil.copy2(media_file, output_path)
@@ -601,23 +595,21 @@ class MetadataInjector:
                 self.errors.append(error_msg)
                 self.stats['errors'] += 1
                 return False
-        
-        # Calculate output path (preserve directory structure relative to input root)
+
         output_path = os.path.join(self.output_root, rel_path)
-        
+
         if self.skip_existing and os.path.exists(output_path):
             logger.debug(f"Skipping (already exists): {output_path}")
             self.stats['skipped_existing'] += 1
             return True
-        
+
         if self.dry_run:
             ext = os.path.splitext(media_file)[1].lower()
             action = "update metadata" if ext in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS else "copy"
             logger.info(f"[DRY RUN] Would {action}: {rel_path} (timestamp: {datetime_str})")
             self.stats['processed'] += 1
             return True
-        
-        # Process the media file
+
         if self.process_media_file(media_file, datetime_str, output_path):
             self.stats['processed'] += 1
             logger.info(f"Successfully processed: {rel_path}")
@@ -625,6 +617,38 @@ class MetadataInjector:
         else:
             self.stats['errors'] += 1
             return False
+
+    def process_metadata_file(self, metadata_file: str) -> bool:
+        """Process a single metadata JSON file and update the corresponding media file."""
+        metadata_dir = os.path.dirname(metadata_file)
+
+        # Find matching media file
+        media_file = self.find_matching_media_file(metadata_file, metadata_dir)
+        if not media_file:
+            logger.warning(f"No matching media file found for {metadata_file}")
+            self.stats['skipped'] += 1
+            return False
+
+        # Read metadata
+        metadata = self.read_metadata_json(metadata_file)
+        if not metadata:
+            self.stats['skipped'] += 1
+            return False
+
+        datetime_str = self.get_photo_taken_time(metadata)
+
+        # Process primary file
+        success = self._dispatch_single_media(media_file, datetime_str)
+
+        # Also process any -edited variant (e.g. photo-edited.jpg alongside photo.jpg).
+        # Google Photos exports edited copies without a separate JSON file; they share
+        # the original's supplemental-metadata.json and should get the same timestamp.
+        stem, ext = os.path.splitext(os.path.basename(media_file))
+        edited_input = os.path.join(os.path.dirname(media_file), f"{stem}-edited{ext}")
+        if os.path.exists(edited_input):
+            self._dispatch_single_media(edited_input, datetime_str)
+
+        return success
     
     def run(self) -> bool:
         """Run the metadata injection process on all metadata files."""
