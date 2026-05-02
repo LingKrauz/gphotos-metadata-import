@@ -435,12 +435,14 @@ class TestEndToEnd:
         unknown_path = os.path.join(str(output_dir), "Unknown Timestamp", "photo.jpg")
         assert os.path.exists(unknown_path)
 
-    def test_no_metadata_files_returns_false(self, tmp_dirs):
-        """Return False when no metadata files are found."""
+    def test_no_files_completes_successfully(self, tmp_dirs):
+        """Empty input directory completes successfully with nothing processed."""
         input_dir, output_dir = tmp_dirs
         injector = self._make_injector(input_dir, output_dir)
         success = injector.run()
-        assert success is False
+        assert success is True
+        assert injector.stats['processed'] == 0
+        assert injector.stats['copied_no_json'] == 0
 
     def test_nested_directory_structure(self, tmp_dirs, make_jpeg, make_metadata_json):
         """Preserve nested directory structure in output."""
@@ -504,3 +506,73 @@ class TestEndToEnd:
         assert injector.stats['processed'] == 5
         assert injector.stats['photos_exif'] == 5
         assert injector.stats['errors'] == 0
+
+    def test_media_without_json_gets_copied(self, tmp_dirs, make_jpeg):
+        """Media files with no supplemental JSON are copied to output."""
+        input_dir, output_dir = tmp_dirs
+        make_jpeg(input_dir, "orphan.jpg")
+
+        injector = self._make_injector(input_dir, output_dir)
+        success = injector.run()
+
+        assert success is True
+        assert injector.stats['copied_no_json'] == 1
+        assert os.path.exists(os.path.join(str(output_dir), "orphan.jpg"))
+
+    def test_media_without_json_preserves_structure(self, tmp_dirs, make_jpeg):
+        """Directory structure is preserved when copying files without JSON."""
+        input_dir, output_dir = tmp_dirs
+        subdir = input_dir / "Photos from 2020"
+        subdir.mkdir()
+        make_jpeg(subdir, "vacation.jpg")
+
+        injector = self._make_injector(input_dir, output_dir)
+        injector.run()
+
+        expected = os.path.join(str(output_dir), "Photos from 2020", "vacation.jpg")
+        assert os.path.exists(expected)
+
+    def test_no_metadata_report_written(self, tmp_dirs, make_jpeg):
+        """A report file is written listing files copied without JSON."""
+        input_dir, output_dir = tmp_dirs
+        make_jpeg(input_dir, "orphan.jpg")
+
+        injector = self._make_injector(input_dir, output_dir)
+        injector.run()
+
+        report_path = os.path.join(str(output_dir), "no_metadata_files.txt")
+        assert os.path.exists(report_path)
+        content = open(report_path, encoding="utf-8").read()
+        assert "orphan.jpg" in content
+
+    def test_no_metadata_report_not_written_when_all_have_json(
+        self, tmp_dirs, make_jpeg, make_metadata_json
+    ):
+        """Report is not written when all media files have a matching JSON."""
+        input_dir, output_dir = tmp_dirs
+        make_jpeg(input_dir, "photo.jpg")
+        make_metadata_json(input_dir, "photo.jpg", timestamp=1609459200)
+
+        injector = self._make_injector(input_dir, output_dir)
+        injector.run()
+
+        report_path = os.path.join(str(output_dir), "no_metadata_files.txt")
+        assert not os.path.exists(report_path)
+
+    def test_mixed_json_and_no_json(self, tmp_dirs, make_jpeg, make_png, make_metadata_json):
+        """Files with JSON get metadata; files without JSON are still copied."""
+        input_dir, output_dir = tmp_dirs
+        make_jpeg(input_dir, "dated.jpg")
+        make_metadata_json(input_dir, "dated.jpg", timestamp=1609459200)
+        make_png(input_dir, "orphan.png")
+
+        injector = self._make_injector(input_dir, output_dir)
+        injector.run()
+
+        assert injector.stats['processed'] == 1
+        assert injector.stats['photos_exif'] == 1
+        assert injector.stats['copied_no_json'] == 1
+        assert os.path.exists(os.path.join(str(output_dir), "dated.jpg"))
+        assert os.path.exists(os.path.join(str(output_dir), "orphan.png"))
+        report_path = os.path.join(str(output_dir), "no_metadata_files.txt")
+        assert os.path.exists(report_path)

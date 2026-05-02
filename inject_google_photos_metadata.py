@@ -163,9 +163,12 @@ class MetadataInjector:
             'photos_gif': 0,       # GIF with comment metadata
             'videos': 0,           # Videos with metadata updated
             'copied_no_metadata': 0,  # Files copied but no metadata update possible
-            'unknown_timestamp': 0    # Files copied to Unknown Timestamp folder
+            'unknown_timestamp': 0,   # Files copied to Unknown Timestamp folder
+            'copied_no_json': 0,      # Media files copied with no supplemental JSON at all
         }
         self.errors: List[str] = []
+        self.processed_media_files: set = set()   # Normalized absolute paths dispatched via JSON
+        self.no_metadata_files: List[Tuple[str, str]] = []  # (input, output) for files without JSON
     
     def find_all_metadata_files(self) -> List[str]:
         """Recursively find all supplemental metadata JSON files."""
@@ -184,6 +187,16 @@ class MetadataInjector:
         
         logger.info(f"Found {len(metadata_files)} metadata files")
         return metadata_files
+
+    def find_all_media_files(self) -> List[str]:
+        """Recursively find all media (image + video) files in the input directory."""
+        media_files = []
+        all_extensions = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+        for root, dirs, files in os.walk(self.input_root):
+            for file in files:
+                if os.path.splitext(file)[1].lower() in all_extensions:
+                    media_files.append(os.path.join(root, file))
+        return media_files
     
     def find_matching_media_file(self, metadata_file: str, metadata_dir: str) -> Optional[str]:
         """
@@ -567,6 +580,9 @@ class MetadataInjector:
         Handles dry-run, skip-existing, unknown-timestamp, and normal paths.
         Returns True on success (including intentional skips).
         """
+        # Mark as handled regardless of outcome so the no-JSON sweep skips it.
+        self.processed_media_files.add(os.path.normcase(os.path.abspath(media_file)))
+
         rel_path = os.path.relpath(media_file, self.input_root)
 
         if not datetime_str:
@@ -650,6 +666,68 @@ class MetadataInjector:
 
         return success
     
+    def _copy_unprocessed_media_files(self):
+        """Copy media files that had no matching supplemental metadata JSON."""
+        all_media = self.find_all_media_files()
+        unprocessed = [
+            f for f in all_media
+            if os.path.normcase(os.path.abspath(f)) not in self.processed_media_files
+        ]
+
+        if not unprocessed:
+            return
+
+        logger.info(f"Found {len(unprocessed)} media files without supplemental metadata — copying as-is")
+        report_entries: List[Tuple[str, str]] = []
+
+        for media_file in sorted(unprocessed):
+            rel_path = os.path.relpath(media_file, self.input_root)
+            output_path = os.path.join(self.output_root, rel_path)
+
+            if self.dry_run:
+                logger.info(f"[DRY RUN] Would copy (no JSON): {rel_path}")
+                report_entries.append((media_file, output_path))
+                self.stats['copied_no_json'] += 1
+                continue
+
+            if self.skip_existing and os.path.exists(output_path):
+                logger.debug(f"Skipping (already exists): {output_path}")
+                self.stats['skipped_existing'] += 1
+                continue
+
+            try:
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                shutil.copy2(media_file, output_path)
+                report_entries.append((media_file, output_path))
+                self.stats['copied_no_json'] += 1
+                logger.debug(f"Copied (no JSON): {rel_path}")
+            except Exception as e:
+                error_msg = f"Failed to copy {media_file}: {e}"
+                logger.error(error_msg)
+                self.errors.append(error_msg)
+                self.stats['errors'] += 1
+
+        self.no_metadata_files = report_entries
+        if report_entries and not self.dry_run:
+            self._write_no_metadata_report(report_entries)
+
+    def _write_no_metadata_report(self, files: List[Tuple[str, str]]):
+        """Write a report listing files copied without any metadata update."""
+        report_path = os.path.join(self.output_root, 'no_metadata_files.txt')
+        try:
+            os.makedirs(self.output_root, exist_ok=True)
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(f"Files copied without metadata update — no supplemental JSON found\n")
+                f.write(f"Total: {len(files)}\n")
+                f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("=" * 80 + "\n\n")
+                for input_path, output_path in files:
+                    f.write(f"Source: {input_path}\n")
+                    f.write(f"Output: {output_path}\n\n")
+            logger.info(f"No-metadata report written: {report_path}")
+        except Exception as e:
+            logger.error(f"Failed to write no-metadata report: {e}")
+
     def run(self) -> bool:
         """Run the metadata injection process on all metadata files."""
         if self.dry_run:
@@ -678,20 +756,20 @@ class MetadataInjector:
         
         metadata_files = self.find_all_metadata_files()
         if not metadata_files:
-            logger.warning("No metadata files found!")
-            return False
-        
-        total = len(metadata_files)
-        progress_interval = max(1, total // 10)  # Log progress every ~10%
-        
-        for i, metadata_file in enumerate(metadata_files, 1):
-            logger.debug(f"Processing {i}/{total}: {metadata_file}")
-            self.process_metadata_file(metadata_file)
+            logger.warning("No supplemental metadata files found — media files will be copied as-is")
+        else:
+            total = len(metadata_files)
+            progress_interval = max(1, total // 10)  # Log progress every ~10%
             
-            if i % progress_interval == 0 or i == total:
-                pct = (i * 100) // total
-                logger.info(f"Progress: {i}/{total} ({pct}%)")
+            for i, metadata_file in enumerate(metadata_files, 1):
+                logger.debug(f"Processing {i}/{total}: {metadata_file}")
+                self.process_metadata_file(metadata_file)
+                
+                if i % progress_interval == 0 or i == total:
+                    pct = (i * 100) // total
+                    logger.info(f"Progress: {i}/{total} ({pct}%)")
         
+        self._copy_unprocessed_media_files()
         self.print_summary()
         return True
     
@@ -712,7 +790,11 @@ class MetadataInjector:
         logger.info(f"Videos:        {self.stats['videos']}")
         logger.info(f"Copied (no metadata): {self.stats['copied_no_metadata']}")
         logger.info(f"Unknown Timestamp: {self.stats['unknown_timestamp']}")
+        logger.info(f"Copied (no JSON):   {self.stats['copied_no_json']}")
         logger.info(f"Log file: {self.log_file}")
+        if self.no_metadata_files:
+            report_path = os.path.join(self.output_root, 'no_metadata_files.txt')
+            logger.info(f"No-metadata report: {report_path}")
         
         if self.errors:
             logger.info(f"\nAll errors ({len(self.errors)} total):")
