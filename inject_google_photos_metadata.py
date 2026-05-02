@@ -56,11 +56,12 @@ except ImportError:
     HAS_HEIF_SUPPORT = False
 
 # Supported file extension sets
-EXIF_IMAGE_EXTENSIONS = frozenset(['.jpg', '.jpeg', '.tiff', '.tif', '.webp', '.mp'])
+EXIF_IMAGE_EXTENSIONS = frozenset(['.jpg', '.jpeg', '.tiff', '.tif', '.webp'])
 PNG_EXTENSIONS = frozenset(['.png'])
 HEIC_EXTENSIONS = frozenset(['.heic'])
 GIF_EXTENSIONS = frozenset(['.gif'])
-COPY_ONLY_IMAGE_EXTENSIONS = frozenset(['.bmp'])
+# .mp = Google Pixel Motion Photo (JPEG + embedded video appended after EOF); copy-only to preserve video data
+COPY_ONLY_IMAGE_EXTENSIONS = frozenset(['.bmp', '.mp'])
 IMAGE_EXTENSIONS = EXIF_IMAGE_EXTENSIONS | PNG_EXTENSIONS | HEIC_EXTENSIONS | GIF_EXTENSIONS | COPY_ONLY_IMAGE_EXTENSIONS
 VIDEO_EXTENSIONS = frozenset(['.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.webm'])
 
