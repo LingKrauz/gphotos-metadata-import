@@ -167,6 +167,7 @@ class MetadataInjector:
             'unknown_timestamp': 0,   # Files copied to Unknown Timestamp folder
             'copied_no_json': 0,      # Media files copied with no supplemental JSON at all
             'gps_injected': 0,        # Files that had GPS coordinates written
+            'timestamps_set': 0,       # Files whose OS timestamps were updated to photo taken time
         }
         self.errors: List[str] = []
         self.processed_media_files: set = set()   # Normalized absolute paths dispatched via JSON
@@ -291,6 +292,54 @@ class MetadataInjector:
                     'alt': float(geo.get('altitude', 0.0)),
                 }
         return None
+
+    def _extract_year_from_path(self, path: str) -> Optional[int]:
+        """Extract a 4-digit year from any ancestor folder name between input_root and the file.
+
+        e.g. …/Photos from 2024/photo.jpg → 2024
+        Returns the year as int, or None if no year found.
+        """
+        rel = os.path.relpath(path, self.input_root)
+        parts = rel.split(os.sep)
+        # Look at directory components only (not the filename itself)
+        for part in parts[:-1]:
+            m = re.search(r'\b(19\d{2}|20\d{2})\b', part)
+            if m:
+                return int(m.group(1))
+        return None
+
+    def _set_file_timestamps(self, path: str, unix_ts: float) -> bool:
+        """Set file modification, access, and (on Windows) creation time to unix_ts.
+
+        Returns True on success, False if the operation failed (non-fatal).
+        """
+        try:
+            os.utime(path, (unix_ts, unix_ts))
+            if sys.platform == 'win32':
+                import ctypes
+                import ctypes.wintypes
+                EPOCH_DIFF = 116444736000000000  # 100-ns intervals from 1601-01-01 to 1970-01-01
+                ft_val = int(unix_ts * 10_000_000) + EPOCH_DIFF
+                ft = ctypes.wintypes.FILETIME(ft_val & 0xFFFFFFFF, ft_val >> 32)
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.CreateFileW(
+                    path,
+                    0x40000000,  # GENERIC_WRITE
+                    0, None,
+                    3,           # OPEN_EXISTING
+                    0x80,        # FILE_ATTRIBUTE_NORMAL
+                    None
+                )
+                if handle == ctypes.wintypes.HANDLE(-1).value:
+                    raise OSError(f"CreateFileW failed (error {kernel32.GetLastError()})")
+                try:
+                    kernel32.SetFileTime(handle, ctypes.byref(ft), None, None)
+                finally:
+                    kernel32.CloseHandle(handle)
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to set file timestamps for {path}: {e}")
+            return False
 
     @staticmethod
     def _to_dms_rational(degrees: float) -> tuple:
@@ -705,6 +754,12 @@ class MetadataInjector:
                 shutil.copy2(media_file, output_path)
                 self.stats['unknown_timestamp'] += 1
                 logger.info(f"Copied to Unknown Timestamp: {rel_path}")
+                # Try folder-year fallback for file timestamps
+                year = self._extract_year_from_path(media_file)
+                if year:
+                    ts = datetime(year, 1, 1, tzinfo=timezone.utc).timestamp()
+                    if self._set_file_timestamps(output_path, ts):
+                        self.stats['timestamps_set'] += 1
                 return True
             except Exception as e:
                 error_msg = f"Failed to copy {media_file} to Unknown Timestamp folder: {e}"
@@ -730,6 +785,13 @@ class MetadataInjector:
         if self.process_media_file(media_file, datetime_str, output_path, gps_data):
             self.stats['processed'] += 1
             logger.info(f"Successfully processed: {rel_path}")
+            # Set OS-level file timestamps to match photoTakenTime
+            try:
+                ts = datetime.strptime(datetime_str, '%Y:%m:%d %H:%M:%S').replace(tzinfo=timezone.utc).timestamp()
+                if self._set_file_timestamps(output_path, ts):
+                    self.stats['timestamps_set'] += 1
+            except Exception as e:
+                logger.debug(f"Could not set file timestamps for {output_path}: {e}")
             return True
         else:
             self.stats['errors'] += 1
@@ -884,6 +946,12 @@ class MetadataInjector:
                 logger.debug(f"Copied (no JSON): {rel_path}")
                 if not self._has_embedded_timestamp(media_file):
                     report_entries.append((media_file, output_path))
+                # Set file timestamps to Jan 1 of the folder year (best available date)
+                year = self._extract_year_from_path(media_file)
+                if year:
+                    ts = datetime(year, 1, 1, tzinfo=timezone.utc).timestamp()
+                    if self._set_file_timestamps(output_path, ts):
+                        self.stats['timestamps_set'] += 1
             except Exception as e:
                 error_msg = f"Failed to copy {media_file}: {e}"
                 logger.error(error_msg)
@@ -975,6 +1043,7 @@ class MetadataInjector:
         logger.info(f"Unknown Timestamp: {self.stats['unknown_timestamp']}")
         logger.info(f"Copied (no JSON):   {self.stats['copied_no_json']}")
         logger.info(f"GPS injected:       {self.stats['gps_injected']}")
+        logger.info(f"Timestamps set:     {self.stats['timestamps_set']}")
         logger.info(f"Log file: {self.log_file}")
         if self.no_metadata_files:
             report_path = os.path.join(self.output_root, 'no_metadata_files.txt')

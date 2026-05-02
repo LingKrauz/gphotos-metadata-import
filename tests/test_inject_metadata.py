@@ -739,3 +739,63 @@ class TestJpegGpsInjection:
         injector.run()
 
         assert injector.stats['gps_injected'] == 0
+
+
+# ---------------------------------------------------------------------------
+# File system timestamp tests
+# ---------------------------------------------------------------------------
+
+class TestFileSystemTimestamps:
+    """Tests for OS-level file timestamp setting."""
+
+    def _make_injector(self, input_dir, output_dir):
+        log_file = os.path.join(str(output_dir), "test.log")
+        setup_logging(log_file)
+        return MetadataInjector(str(input_dir), str(output_dir), log_file)
+
+    def test_file_mtime_set_from_json(self, tmp_dirs, make_jpeg, make_metadata_json):
+        """After processing, output file mtime matches photoTakenTime."""
+        input_dir, output_dir = tmp_dirs
+        timestamp = 1609459200  # 2021-01-01 00:00:00 UTC
+        make_jpeg(input_dir, "photo.jpg")
+        make_metadata_json(input_dir, "photo.jpg", timestamp=timestamp)
+
+        injector = self._make_injector(input_dir, output_dir)
+        injector.run()
+
+        output_file = os.path.join(str(output_dir), "photo.jpg")
+        assert os.path.exists(output_file)
+        mtime = os.path.getmtime(output_file)
+        assert mtime == pytest.approx(timestamp, abs=1.0)
+        assert injector.stats['timestamps_set'] == 1
+
+    def test_no_json_mtime_set_from_folder_year(self, tmp_dirs, make_jpeg):
+        """Orphan file in 'Photos from 2019' folder gets mtime of Jan 1, 2019."""
+        input_dir, output_dir = tmp_dirs
+        subdir = input_dir / "Photos from 2019"
+        subdir.mkdir()
+        make_jpeg(subdir, "orphan.jpg")
+
+        injector = self._make_injector(input_dir, output_dir)
+        injector.run()
+
+        output_file = os.path.join(str(output_dir), "Photos from 2019", "orphan.jpg")
+        assert os.path.exists(output_file)
+        mtime = os.path.getmtime(output_file)
+        from datetime import timezone as _tz
+        expected_ts = __import__('datetime').datetime(2019, 1, 1, tzinfo=_tz.utc).timestamp()
+        assert mtime == pytest.approx(expected_ts, abs=1.0)
+        assert injector.stats['timestamps_set'] == 1
+
+    def test_no_json_no_year_in_path_timestamps_not_set(self, tmp_dirs, make_jpeg):
+        """Orphan file in folder with no year in name: timestamps_set stat stays 0."""
+        input_dir, output_dir = tmp_dirs
+        subdir = input_dir / "Miscellaneous"
+        subdir.mkdir()
+        make_jpeg(subdir, "orphan.jpg")
+
+        injector = self._make_injector(input_dir, output_dir)
+        injector.run()
+
+        assert os.path.exists(os.path.join(str(output_dir), "Miscellaneous", "orphan.jpg"))
+        assert injector.stats['timestamps_set'] == 0
