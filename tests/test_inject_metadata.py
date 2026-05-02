@@ -533,7 +533,7 @@ class TestEndToEnd:
         assert os.path.exists(expected)
 
     def test_no_metadata_report_written(self, tmp_dirs, make_jpeg):
-        """A report file is written listing files copied without JSON."""
+        """Report lists files that have no JSON and no embedded timestamp."""
         input_dir, output_dir = tmp_dirs
         make_jpeg(input_dir, "orphan.jpg")
 
@@ -544,6 +544,39 @@ class TestEndToEnd:
         assert os.path.exists(report_path)
         content = open(report_path, encoding="utf-8").read()
         assert "orphan.jpg" in content
+
+    def test_already_dated_file_excluded_from_report(
+        self, tmp_dirs, make_jpeg_with_exif
+    ):
+        """Files with an embedded EXIF timestamp are copied but not listed in the report."""
+        input_dir, output_dir = tmp_dirs
+        make_jpeg_with_exif(input_dir, "already_dated.jpg")
+
+        injector = self._make_injector(input_dir, output_dir)
+        injector.run()
+
+        assert injector.stats['copied_no_json'] == 1
+        assert os.path.exists(os.path.join(str(output_dir), "already_dated.jpg"))
+        report_path = os.path.join(str(output_dir), "no_metadata_files.txt")
+        assert not os.path.exists(report_path)
+
+    def test_mixed_dated_and_undated_without_json(
+        self, tmp_dirs, make_jpeg, make_jpeg_with_exif
+    ):
+        """Only truly undated orphan files appear in the report."""
+        input_dir, output_dir = tmp_dirs
+        make_jpeg(input_dir, "undated.jpg")
+        make_jpeg_with_exif(input_dir, "dated.jpg")
+
+        injector = self._make_injector(input_dir, output_dir)
+        injector.run()
+
+        assert injector.stats['copied_no_json'] == 2
+        report_path = os.path.join(str(output_dir), "no_metadata_files.txt")
+        assert os.path.exists(report_path)
+        content = open(report_path, encoding="utf-8").read()
+        assert os.sep + "undated.jpg" in content
+        assert os.sep + "dated.jpg" not in content
 
     def test_no_metadata_report_not_written_when_all_have_json(
         self, tmp_dirs, make_jpeg, make_metadata_json

@@ -666,6 +666,85 @@ class MetadataInjector:
 
         return success
     
+    def _has_embedded_timestamp(self, file_path: str) -> bool:
+        """Return True if the file already contains an embedded date/time stamp."""
+        ext = os.path.splitext(file_path)[1].lower()
+        try:
+            if ext in EXIF_IMAGE_EXTENSIONS | HEIC_EXTENSIONS:
+                return self._has_exif_timestamp(file_path)
+            elif ext in PNG_EXTENSIONS:
+                return self._has_png_timestamp(file_path)
+            elif ext in GIF_EXTENSIONS:
+                return self._has_gif_timestamp(file_path)
+            elif ext in VIDEO_EXTENSIONS:
+                return self._has_video_timestamp(file_path)
+        except Exception:
+            pass
+        return False
+
+    def _has_exif_timestamp(self, file_path: str) -> bool:
+        """Check for DateTimeOriginal in EXIF (JPEG/TIFF/WebP/HEIC)."""
+        if piexif:
+            try:
+                exif_dict = piexif.load(file_path)
+                val = exif_dict.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal, b"")
+                if val and val.strip(b'\x00'):
+                    return True
+            except Exception:
+                pass
+        try:
+            img = Image.open(file_path)
+            val = img.getexif().get(36867)  # DateTimeOriginal
+            if val and str(val).strip():
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _has_png_timestamp(self, file_path: str) -> bool:
+        """Check for date text chunks in a PNG."""
+        try:
+            img = Image.open(file_path)
+            for key in ('DateTimeOriginal', 'CreationTime', 'GooglePhotosTaken', 'date:create'):
+                if img.info.get(key):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _has_gif_timestamp(self, file_path: str) -> bool:
+        """Check for a DateTimeOriginal comment in a GIF."""
+        try:
+            img = Image.open(file_path)
+            comment = img.info.get("comment", b"")
+            if isinstance(comment, bytes):
+                comment = comment.decode('utf-8', errors='ignore')
+            return 'DateTimeOriginal' in comment or 'GooglePhotosTaken' in comment
+        except Exception:
+            pass
+        return False
+
+    def _has_video_timestamp(self, file_path: str) -> bool:
+        """Check for a non-epoch creation_time in a video's container metadata."""
+        if not HAS_FFMPEG or not FFMPEG_CMD:
+            return False
+        try:
+            result = subprocess.run(
+                [FFMPEG_CMD, '-i', file_path],
+                capture_output=True, text=True, timeout=15,
+            )
+            match = re.search(r'creation_time\s*:\s*(\S+)', result.stderr)
+            if match:
+                ts = match.group(1).rstrip(',')
+                return ts not in (
+                    '1970-01-01T00:00:00.000000Z',
+                    '0000-00-00T00:00:00.000000Z',
+                    'N/A',
+                )
+        except Exception:
+            pass
+        return False
+
     def _copy_unprocessed_media_files(self):
         """Copy media files that had no matching supplemental metadata JSON."""
         all_media = self.find_all_media_files()
@@ -686,7 +765,8 @@ class MetadataInjector:
 
             if self.dry_run:
                 logger.info(f"[DRY RUN] Would copy (no JSON): {rel_path}")
-                report_entries.append((media_file, output_path))
+                if not self._has_embedded_timestamp(media_file):
+                    report_entries.append((media_file, output_path))
                 self.stats['copied_no_json'] += 1
                 continue
 
@@ -698,9 +778,10 @@ class MetadataInjector:
             try:
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
                 shutil.copy2(media_file, output_path)
-                report_entries.append((media_file, output_path))
                 self.stats['copied_no_json'] += 1
                 logger.debug(f"Copied (no JSON): {rel_path}")
+                if not self._has_embedded_timestamp(media_file):
+                    report_entries.append((media_file, output_path))
             except Exception as e:
                 error_msg = f"Failed to copy {media_file}: {e}"
                 logger.error(error_msg)
@@ -717,7 +798,7 @@ class MetadataInjector:
         try:
             os.makedirs(self.output_root, exist_ok=True)
             with open(report_path, 'w', encoding='utf-8') as f:
-                f.write(f"Files copied without metadata update — no supplemental JSON found\n")
+                f.write(f"Files copied without any date metadata — no supplemental JSON and no embedded timestamp\n")
                 f.write(f"Total: {len(files)}\n")
                 f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("=" * 80 + "\n\n")

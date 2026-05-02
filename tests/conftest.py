@@ -85,6 +85,31 @@ def make_metadata_json():
 
 
 @pytest.fixture
+def make_jpeg_with_exif():
+    """Factory fixture to create a JPEG with DateTimeOriginal already embedded."""
+    def _make(directory, name="photo_with_exif.jpg", datetime_str="2021:06:15 14:30:00"):
+        path = os.path.join(str(directory), name)
+        img = Image.new("RGB", (10, 10), color="red")
+        img.save(path, "JPEG")
+        try:
+            import piexif as _piexif
+            exif_dict = {
+                "0th": {},
+                "Exif": {_piexif.ExifIFD.DateTimeOriginal: datetime_str.encode()},
+            }
+            exif_bytes = _piexif.dump(exif_dict)
+            img2 = Image.open(path)
+            img2.save(path, "JPEG", exif=exif_bytes)
+        except ImportError:
+            img2 = Image.open(path)
+            exif = img2.getexif()
+            exif[36867] = datetime_str
+            img2.save(path, "JPEG", exif=exif.tobytes())
+        return path
+    return _make
+
+
+@pytest.fixture
 def make_metadata_json_no_timestamp():
     """Factory fixture to create a metadata JSON with no timestamp."""
     def _make(directory, media_filename):
