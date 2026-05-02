@@ -56,7 +56,7 @@ except ImportError:
     HAS_HEIF_SUPPORT = False
 
 # Supported file extension sets
-EXIF_IMAGE_EXTENSIONS = frozenset(['.jpg', '.jpeg', '.tiff', '.tif', '.webp'])
+EXIF_IMAGE_EXTENSIONS = frozenset(['.jpg', '.jpeg', '.tiff', '.tif', '.webp', '.mp'])
 PNG_EXTENSIONS = frozenset(['.png'])
 HEIC_EXTENSIONS = frozenset(['.heic'])
 GIF_EXTENSIONS = frozenset(['.gif'])
