@@ -783,7 +783,7 @@ class TestFileSystemTimestamps:
         assert os.path.exists(output_file)
         mtime = os.path.getmtime(output_file)
         from datetime import timezone as _tz
-        expected_ts = __import__('datetime').datetime(2019, 1, 1, tzinfo=_tz.utc).timestamp()
+        expected_ts = __import__('datetime').datetime(2019, 1, 1, 12, 0, 0, tzinfo=_tz.utc).timestamp()
         assert mtime == pytest.approx(expected_ts, abs=1.0)
         assert injector.stats['timestamps_set'] == 1
 

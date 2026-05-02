@@ -757,7 +757,7 @@ class MetadataInjector:
                 # Try folder-year fallback for file timestamps
                 year = self._extract_year_from_path(media_file)
                 if year:
-                    ts = datetime(year, 1, 1, tzinfo=timezone.utc).timestamp()
+                    ts = datetime(year, 1, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp()
                     if self._set_file_timestamps(output_path, ts):
                         self.stats['timestamps_set'] += 1
                 return True
@@ -949,7 +949,7 @@ class MetadataInjector:
                 # Set file timestamps to Jan 1 of the folder year (best available date)
                 year = self._extract_year_from_path(media_file)
                 if year:
-                    ts = datetime(year, 1, 1, tzinfo=timezone.utc).timestamp()
+                    ts = datetime(year, 1, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp()
                     if self._set_file_timestamps(output_path, ts):
                         self.stats['timestamps_set'] += 1
             except Exception as e:
