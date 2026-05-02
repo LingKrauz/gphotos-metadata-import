@@ -166,6 +166,7 @@ class MetadataInjector:
             'copied_no_metadata': 0,  # Files copied but no metadata update possible
             'unknown_timestamp': 0,   # Files copied to Unknown Timestamp folder
             'copied_no_json': 0,      # Media files copied with no supplemental JSON at all
+            'gps_injected': 0,        # Files that had GPS coordinates written
         }
         self.errors: List[str] = []
         self.processed_media_files: set = set()   # Normalized absolute paths dispatched via JSON
@@ -274,18 +275,55 @@ class MetadataInjector:
         except Exception as e:
             logger.debug(f"Failed to extract photo taken time: {e}")
             return None
+
+    def get_gps_data(self, metadata: Dict) -> Optional[Dict]:
+        """Extract GPS coordinates from metadata.
+
+        Prefers geoDataExif (sourced from original EXIF) over geoData (Google-enriched).
+        Returns {'lat': float, 'lon': float, 'alt': float} or None if no valid GPS.
+        """
+        for key in ('geoDataExif', 'geoData'):
+            geo = metadata.get(key)
+            if geo and (geo.get('latitude', 0.0) != 0.0 or geo.get('longitude', 0.0) != 0.0):
+                return {
+                    'lat': float(geo['latitude']),
+                    'lon': float(geo['longitude']),
+                    'alt': float(geo.get('altitude', 0.0)),
+                }
+        return None
+
+    @staticmethod
+    def _to_dms_rational(degrees: float) -> tuple:
+        """Convert decimal degrees to an EXIF DMS rational tuple ((d,1),(m,1),(s_num,10000))."""
+        d = int(abs(degrees))
+        m_float = (abs(degrees) - d) * 60
+        m = int(m_float)
+        s = (m_float - m) * 60
+        return ((d, 1), (m, 1), (round(s * 10000), 10000))
+
+    def _build_gps_ifd(self, gps_data: Dict) -> Dict:
+        """Build a piexif GPS IFD dict from {'lat', 'lon', 'alt'}."""
+        return {
+            piexif.GPSIFD.GPSLatitudeRef:  b'N' if gps_data['lat'] >= 0 else b'S',
+            piexif.GPSIFD.GPSLatitude:     self._to_dms_rational(gps_data['lat']),
+            piexif.GPSIFD.GPSLongitudeRef: b'E' if gps_data['lon'] >= 0 else b'W',
+            piexif.GPSIFD.GPSLongitude:    self._to_dms_rational(gps_data['lon']),
+            piexif.GPSIFD.GPSAltitudeRef:  0 if gps_data['alt'] >= 0 else 1,
+            piexif.GPSIFD.GPSAltitude:     (round(abs(gps_data['alt']) * 100), 100),
+        }
     
-    def update_photo_exif(self, photo_path: str, datetime_str: str) -> bool:
-        """Update EXIF DateTimeOriginal in a photo file."""
+    def update_photo_exif(self, photo_path: str, datetime_str: str,
+                          gps_data: Optional[Dict] = None) -> bool:
+        """Update EXIF DateTimeOriginal (and optionally GPS) in a photo file."""
         ext = os.path.splitext(photo_path)[1].lower()
         
         # Handle different image formats
         if ext in ['.jpg', '.jpeg', '.tiff', '.tif']:
-            return self._update_photo_exif_standard(photo_path, datetime_str)
+            return self._update_photo_exif_standard(photo_path, datetime_str, gps_data)
         elif ext == '.webp':
-            return self._update_photo_exif_standard(photo_path, datetime_str)
+            return self._update_photo_exif_standard(photo_path, datetime_str, gps_data)
         elif ext == '.heic':
-            return self._update_photo_exif_heic(photo_path, datetime_str)
+            return self._update_photo_exif_heic(photo_path, datetime_str, gps_data)
         elif ext == '.png':
             return self._update_photo_exif_png(photo_path, datetime_str)
         elif ext == '.gif':
@@ -304,7 +342,8 @@ class MetadataInjector:
         except OSError:
             pass
 
-    def _update_photo_exif_piexif(self, photo_path: str, datetime_str: str) -> bool:
+    def _update_photo_exif_piexif(self, photo_path: str, datetime_str: str,
+                                  gps_data: Optional[Dict] = None) -> bool:
         """Update EXIF for JPEG using piexif.insert() — splices EXIF bytes directly into the
         JPEG stream without re-encoding, preserving original quality and file size."""
         ext = os.path.splitext(photo_path)[1].lower()
@@ -327,6 +366,10 @@ class MetadataInjector:
             exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = datetime_str.encode('utf-8')
             # Update DateTime (tag 0x0132 / 306)
             exif_dict["0th"][piexif.ImageIFD.DateTime] = datetime_str.encode('utf-8')
+
+            if gps_data:
+                exif_dict["GPS"] = self._build_gps_ifd(gps_data)
+
             exif_bytes = piexif.dump(exif_dict)
 
             # piexif.insert(exif, src, dst) copies src→dst with updated EXIF — no pixel re-encoding
@@ -339,18 +382,45 @@ class MetadataInjector:
             logger.debug(f"piexif update failed for {photo_path}, trying Pillow: {str(e)}")
             return False
 
-    def _update_photo_exif_pillow(self, photo_path: str, datetime_str: str) -> bool:
-        """Fallback EXIF update using Pillow's getexif()/tobytes() — handles WebP, TIFF, and
-        JPEG when piexif is unavailable."""
+    def _update_photo_exif_pillow(self, photo_path: str, datetime_str: str,
+                                  gps_data: Optional[Dict] = None) -> bool:
+        """Fallback EXIF update using Pillow — handles WebP, TIFF, and JPEG when piexif
+        is unavailable. Uses piexif for EXIF byte construction when available (GPS support)."""
         temp_path = photo_path + '.tmp'
         try:
             ext = os.path.splitext(photo_path)[1].lower()
             image = Image.open(photo_path)
-            exif = image.getexif()
-            # Exif tag numbers: 36867 = DateTimeOriginal, 306 = DateTime
-            exif[36867] = datetime_str
-            exif[306] = datetime_str
-            save_kwargs = {"format": image.format, "exif": exif.tobytes()}
+
+            if piexif:
+                # Build full EXIF bytes via piexif so GPS IFD is written correctly
+                try:
+                    exif_dict = piexif.load(photo_path)
+                except Exception:
+                    exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "Interop": {}, "1st": {}}
+                if "Exif" not in exif_dict:
+                    exif_dict["Exif"] = {}
+                if "0th" not in exif_dict:
+                    exif_dict["0th"] = {}
+                exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = datetime_str.encode('utf-8')
+                exif_dict["0th"][piexif.ImageIFD.DateTime] = datetime_str.encode('utf-8')
+                if gps_data:
+                    exif_dict["GPS"] = self._build_gps_ifd(gps_data)
+                try:
+                    exif_bytes = piexif.dump(exif_dict)
+                except Exception:
+                    # Malformed existing EXIF (e.g. wrong-typed tag); fall back to Pillow native
+                    exif = image.getexif()
+                    exif[36867] = datetime_str
+                    exif[306] = datetime_str
+                    exif_bytes = exif.tobytes()
+            else:
+                exif = image.getexif()
+                # Exif tag numbers: 36867 = DateTimeOriginal, 306 = DateTime
+                exif[36867] = datetime_str
+                exif[306] = datetime_str
+                exif_bytes = exif.tobytes()
+
+            save_kwargs = {"format": image.format, "exif": exif_bytes}
             if ext in ('.jpg', '.jpeg'):
                 # quality='keep' preserves original JPEG compression level (Pillow 9.1+)
                 save_kwargs["quality"] = 'keep'
@@ -364,18 +434,19 @@ class MetadataInjector:
             logger.debug(f"Pillow EXIF update failed for {photo_path}: {e}")
             return False
 
-    def _update_photo_exif_standard(self, photo_path: str, datetime_str: str) -> bool:
+    def _update_photo_exif_standard(self, photo_path: str, datetime_str: str,
+                                    gps_data: Optional[Dict] = None) -> bool:
         """Update EXIF for JPEG/TIFF files using piexif when available, falling back to Pillow."""
         try:
             # Try piexif first (more reliable for EXIF)
             if piexif:
-                success = self._update_photo_exif_piexif(photo_path, datetime_str)
+                success = self._update_photo_exif_piexif(photo_path, datetime_str, gps_data)
                 if success:
                     return True
                 # fall through to Pillow fallback if piexif approach failed
 
             # Try Pillow fallback
-            return self._update_photo_exif_pillow(photo_path, datetime_str)
+            return self._update_photo_exif_pillow(photo_path, datetime_str, gps_data)
         except Exception as e:
             error_msg = f"Failed to update EXIF for {photo_path}: {e}"
             logger.error(error_msg)
@@ -415,7 +486,8 @@ class MetadataInjector:
         
         return png_info
     
-    def _update_photo_exif_heic(self, photo_path: str, datetime_str: str) -> bool:
+    def _update_photo_exif_heic(self, photo_path: str, datetime_str: str,
+                                gps_data: Optional[Dict] = None) -> bool:
         """Update HEIC file metadata."""
         try:
             if not HAS_HEIF_SUPPORT:
@@ -429,6 +501,8 @@ class MetadataInjector:
                 exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = datetime_str.encode('utf-8')
                 exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = datetime_str.encode('utf-8')
                 exif_dict["0th"][piexif.ImageIFD.DateTime] = datetime_str.encode('utf-8')
+                if gps_data:
+                    exif_dict["GPS"] = self._build_gps_ifd(gps_data)
                 exif_bytes = piexif.dump(exif_dict)
 
                 temp_path = photo_path + '.tmp.heic'
@@ -465,8 +539,9 @@ class MetadataInjector:
             logger.debug(f"GIF metadata update failed for {photo_path}: {e}")
             return False
     
-    def update_video_metadata(self, video_path: str, datetime_str: str) -> Optional[bool]:
-        """Update creation time metadata in a video file.
+    def update_video_metadata(self, video_path: str, datetime_str: str,
+                              gps_data: Optional[Dict] = None) -> Optional[bool]:
+        """Update creation time (and optionally GPS) metadata in a video file.
         
         Returns True on success, False on error, None if skipped (ffmpeg unavailable).
         """
@@ -490,9 +565,16 @@ class MetadataInjector:
                 '-i', video_path,
                 '-c', 'copy',  # Copy without re-encoding
                 '-metadata', f'creation_time={iso_datetime}',
-                '-y',  # Overwrite without asking
-                temp_output
             ]
+
+            if gps_data:
+                # ISO 6709 location string: ±DD.DDDD±DDD.DDDD/ (lat then lon)
+                lat, lon = gps_data['lat'], gps_data['lon']
+                location = f"{'+' if lat >= 0 else ''}{lat:.4f}{'+' if lon >= 0 else ''}{lon:.4f}/"
+                cmd.extend(['-metadata', f'location={location}'])
+                cmd.extend(['-metadata', f'location-eng={location}'])
+
+            cmd.extend(['-y', temp_output])  # Overwrite without asking
             
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             
@@ -539,7 +621,8 @@ class MetadataInjector:
             return 'gif'
         return None
 
-    def process_media_file(self, media_path: str, datetime_str: str, output_path: str) -> bool:
+    def process_media_file(self, media_path: str, datetime_str: str, output_path: str,
+                           gps_data: Optional[Dict] = None) -> bool:
         """Process a media file: copy it and update its metadata based on type."""
         try:
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -548,9 +631,11 @@ class MetadataInjector:
             ext = os.path.splitext(output_path)[1].lower()
             
             if ext in VIDEO_EXTENSIONS:
-                result = self.update_video_metadata(output_path, datetime_str)
+                result = self.update_video_metadata(output_path, datetime_str, gps_data)
                 if result is True:
                     self.stats['videos'] += 1
+                    if gps_data:
+                        self.stats['gps_injected'] += 1
                     return True
                 elif result is None:
                     self.stats['copied_no_metadata'] += 1
@@ -564,14 +649,16 @@ class MetadataInjector:
             if ext in IMAGE_EXTENSIONS:
                 category = self._get_image_category(ext)
                 if category is None:
-                    # Copy-only formats (e.g. BMP) — no metadata handler
+                    # Copy-only formats (e.g. BMP, MP) — no metadata handler
                     self.stats['copied_no_metadata'] += 1
                     return True
                 
                 stat_key, display_name = self._IMAGE_STAT_MAP[category]
-                success = self.update_photo_exif(output_path, datetime_str)
+                success = self.update_photo_exif(output_path, datetime_str, gps_data)
                 if success:
                     self.stats[stat_key] += 1
+                    if gps_data and category in ('exif', 'heic'):
+                        self.stats['gps_injected'] += 1
                 else:
                     error_msg = f"Failed to update {display_name} metadata for {output_path}"
                     logger.warning(f"Metadata update failed: {output_path} ({display_name})")
@@ -587,9 +674,10 @@ class MetadataInjector:
             self.errors.append(error_msg)
             return False
     
-    def _dispatch_single_media(self, media_file: str, datetime_str: Optional[str]) -> bool:
+    def _dispatch_single_media(self, media_file: str, datetime_str: Optional[str],
+                               gps_data: Optional[Dict] = None) -> bool:
         """
-        Copy one media file to the output tree and inject its timestamp.
+        Copy one media file to the output tree and inject its timestamp and GPS.
         Handles dry-run, skip-existing, unknown-timestamp, and normal paths.
         Returns True on success (including intentional skips).
         """
@@ -639,7 +727,7 @@ class MetadataInjector:
             self.stats['processed'] += 1
             return True
 
-        if self.process_media_file(media_file, datetime_str, output_path):
+        if self.process_media_file(media_file, datetime_str, output_path, gps_data):
             self.stats['processed'] += 1
             logger.info(f"Successfully processed: {rel_path}")
             return True
@@ -665,9 +753,10 @@ class MetadataInjector:
             return False
 
         datetime_str = self.get_photo_taken_time(metadata)
+        gps_data = self.get_gps_data(metadata)
 
         # Process primary file
-        success = self._dispatch_single_media(media_file, datetime_str)
+        success = self._dispatch_single_media(media_file, datetime_str, gps_data)
 
         # Also process any -edited variant (e.g. photo-edited.jpg alongside photo.jpg).
         # Google Photos exports edited copies without a separate JSON file; they share
@@ -675,7 +764,7 @@ class MetadataInjector:
         stem, ext = os.path.splitext(os.path.basename(media_file))
         edited_input = os.path.join(os.path.dirname(media_file), f"{stem}-edited{ext}")
         if os.path.exists(edited_input):
-            self._dispatch_single_media(edited_input, datetime_str)
+            self._dispatch_single_media(edited_input, datetime_str, gps_data)
 
         return success
     
@@ -885,6 +974,7 @@ class MetadataInjector:
         logger.info(f"Copied (no metadata): {self.stats['copied_no_metadata']}")
         logger.info(f"Unknown Timestamp: {self.stats['unknown_timestamp']}")
         logger.info(f"Copied (no JSON):   {self.stats['copied_no_json']}")
+        logger.info(f"GPS injected:       {self.stats['gps_injected']}")
         logger.info(f"Log file: {self.log_file}")
         if self.no_metadata_files:
             report_path = os.path.join(self.output_root, 'no_metadata_files.txt')

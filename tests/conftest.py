@@ -119,3 +119,40 @@ def make_metadata_json_no_timestamp():
             json.dump(data, f)
         return json_path
     return _make
+
+
+@pytest.fixture
+def make_metadata_json_with_gps():
+    """Factory fixture to create a metadata JSON file with GPS coordinates."""
+    def _make(directory, media_filename, timestamp=1609459200,
+              lat=39.5023, lon=-104.7447, alt=1609.0,
+              zero_geo_data_exif=False):
+        """
+        Creates a JSON with both geoData and geoDataExif fields.
+        Set zero_geo_data_exif=True to test fallback to geoData.
+        """
+        json_path = os.path.join(str(directory), media_filename + ".supplemental-metadata.json")
+        data = {
+            "photoTakenTime": {
+                "timestamp": str(timestamp),
+                "formatted": "Jan 1, 2021, 12:00:00 AM UTC"
+            },
+            "geoData": {
+                "latitude": lat,
+                "longitude": lon,
+                "altitude": alt,
+                "latitudeSpan": 0.001,
+                "longitudeSpan": 0.001
+            },
+            "geoDataExif": {
+                "latitude": 0.0 if zero_geo_data_exif else lat,
+                "longitude": 0.0 if zero_geo_data_exif else lon,
+                "altitude": 0.0 if zero_geo_data_exif else alt,
+                "latitudeSpan": 0.001,
+                "longitudeSpan": 0.001
+            },
+        }
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        return json_path
+    return _make

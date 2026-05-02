@@ -609,3 +609,133 @@ class TestEndToEnd:
         assert os.path.exists(os.path.join(str(output_dir), "orphan.png"))
         report_path = os.path.join(str(output_dir), "no_metadata_files.txt")
         assert os.path.exists(report_path)
+
+
+# ---------------------------------------------------------------------------
+# GPS tests
+# ---------------------------------------------------------------------------
+
+class TestGetGpsData:
+    """Tests for MetadataInjector.get_gps_data."""
+
+    def _make_injector(self, tmp_dirs):
+        input_dir, output_dir = tmp_dirs
+        log_file = os.path.join(str(output_dir), "test.log")
+        setup_logging(log_file)
+        return MetadataInjector(str(input_dir), str(output_dir), log_file)
+
+    def test_prefers_geo_data_exif(self, tmp_dirs):
+        """get_gps_data returns geoDataExif values when non-zero."""
+        injector = self._make_injector(tmp_dirs)
+        metadata = {
+            "geoData": {"latitude": 1.0, "longitude": 2.0, "altitude": 3.0},
+            "geoDataExif": {"latitude": 39.5023, "longitude": -104.7447, "altitude": 1609.0},
+        }
+        result = injector.get_gps_data(metadata)
+        assert result is not None
+        assert result['lat'] == pytest.approx(39.5023)
+        assert result['lon'] == pytest.approx(-104.7447)
+        assert result['alt'] == pytest.approx(1609.0)
+
+    def test_falls_back_to_geo_data(self, tmp_dirs):
+        """get_gps_data falls back to geoData when geoDataExif is all zeros."""
+        injector = self._make_injector(tmp_dirs)
+        metadata = {
+            "geoData": {"latitude": 39.5023, "longitude": -104.7447, "altitude": 1609.0},
+            "geoDataExif": {"latitude": 0.0, "longitude": 0.0, "altitude": 0.0},
+        }
+        result = injector.get_gps_data(metadata)
+        assert result is not None
+        assert result['lat'] == pytest.approx(39.5023)
+        assert result['lon'] == pytest.approx(-104.7447)
+
+    def test_returns_none_when_both_zero(self, tmp_dirs):
+        """get_gps_data returns None when both fields have zero coordinates."""
+        injector = self._make_injector(tmp_dirs)
+        metadata = {
+            "geoData": {"latitude": 0.0, "longitude": 0.0, "altitude": 0.0},
+            "geoDataExif": {"latitude": 0.0, "longitude": 0.0, "altitude": 0.0},
+        }
+        result = injector.get_gps_data(metadata)
+        assert result is None
+
+    def test_returns_none_when_fields_missing(self, tmp_dirs):
+        """get_gps_data returns None when geoData/geoDataExif fields are absent."""
+        injector = self._make_injector(tmp_dirs)
+        metadata = {"photoTakenTime": {"timestamp": "1609459200"}}
+        result = injector.get_gps_data(metadata)
+        assert result is None
+
+
+class TestJpegGpsInjection:
+    """Tests for GPS coordinate injection into JPEG files."""
+
+    def _make_injector(self, tmp_dirs):
+        input_dir, output_dir = tmp_dirs
+        log_file = os.path.join(str(output_dir), "test.log")
+        setup_logging(log_file)
+        return MetadataInjector(str(input_dir), str(output_dir), log_file)
+
+    def test_jpeg_gps_written_and_readable(self, tmp_dirs, make_jpeg):
+        """GPS IFD tags are written to JPEG and can be read back via piexif."""
+        pytest.importorskip("piexif")
+        import piexif
+
+        input_dir, output_dir = tmp_dirs
+        photo_path = make_jpeg(output_dir, "gps_test.jpg")
+        injector = self._make_injector(tmp_dirs)
+
+        gps_data = {"lat": 39.5023, "lon": -104.7447, "alt": 1609.0}
+        result = injector.update_photo_exif(photo_path, "2021:01:01 00:00:00", gps_data)
+        assert result is True
+
+        exif_dict = piexif.load(photo_path)
+        gps = exif_dict.get("GPS", {})
+        assert piexif.GPSIFD.GPSLatitudeRef in gps
+        assert piexif.GPSIFD.GPSLongitudeRef in gps
+        assert gps[piexif.GPSIFD.GPSLatitudeRef] == b'N'
+        assert gps[piexif.GPSIFD.GPSLongitudeRef] == b'W'
+
+        # Verify latitude reconstructed from DMS is approximately correct
+        lat_dms = gps[piexif.GPSIFD.GPSLatitude]
+        lat = lat_dms[0][0]/lat_dms[0][1] + lat_dms[1][0]/lat_dms[1][1]/60 + lat_dms[2][0]/lat_dms[2][1]/3600
+        assert lat == pytest.approx(39.5023, abs=0.0001)
+
+    def test_jpeg_southern_hemisphere_ref(self, tmp_dirs, make_jpeg):
+        """Negative latitude correctly written as 'S' ref."""
+        pytest.importorskip("piexif")
+        import piexif
+
+        input_dir, output_dir = tmp_dirs
+        photo_path = make_jpeg(output_dir, "south.jpg")
+        injector = self._make_injector(tmp_dirs)
+
+        gps_data = {"lat": -33.8688, "lon": 151.2093, "alt": 10.0}
+        injector.update_photo_exif(photo_path, "2021:01:01 00:00:00", gps_data)
+
+        exif_dict = piexif.load(photo_path)
+        gps = exif_dict.get("GPS", {})
+        assert gps[piexif.GPSIFD.GPSLatitudeRef] == b'S'
+        assert gps[piexif.GPSIFD.GPSLongitudeRef] == b'E'
+
+    def test_jpeg_gps_stat_incremented(self, tmp_dirs, make_jpeg, make_metadata_json_with_gps):
+        """End-to-end: gps_injected stat is incremented when GPS is written."""
+        input_dir, output_dir = tmp_dirs
+        make_jpeg(input_dir, "photo.jpg")
+        make_metadata_json_with_gps(input_dir, "photo.jpg")
+
+        injector = self._make_injector(tmp_dirs)
+        injector.run()
+
+        assert injector.stats['gps_injected'] == 1
+
+    def test_zero_gps_not_injected(self, tmp_dirs, make_jpeg, make_metadata_json):
+        """GPS is not injected and stat stays 0 when JSON has no GPS coordinates."""
+        input_dir, output_dir = tmp_dirs
+        make_jpeg(input_dir, "photo.jpg")
+        make_metadata_json(input_dir, "photo.jpg")
+
+        injector = self._make_injector(tmp_dirs)
+        injector.run()
+
+        assert injector.stats['gps_injected'] == 0
