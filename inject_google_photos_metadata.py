@@ -305,12 +305,19 @@ class MetadataInjector:
             pass
 
     def _update_photo_exif_piexif(self, photo_path: str, datetime_str: str) -> bool:
-        """Update EXIF using piexif library and save via Pillow to a temp file."""
+        """Update EXIF for JPEG using piexif.insert() — splices EXIF bytes directly into the
+        JPEG stream without re-encoding, preserving original quality and file size."""
+        ext = os.path.splitext(photo_path)[1].lower()
+        if ext not in ('.jpg', '.jpeg'):
+            return False  # Let Pillow handle WebP/TIFF without risking quality loss
+
         temp_path = photo_path + '.tmp'
         try:
-            exif_dict = piexif.load(photo_path)
+            try:
+                exif_dict = piexif.load(photo_path)
+            except Exception:
+                exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "Interop": {}, "1st": {}}
 
-            # Ensure Exif and 0th exist
             if "Exif" not in exif_dict:
                 exif_dict["Exif"] = {}
             if "0th" not in exif_dict:
@@ -320,12 +327,10 @@ class MetadataInjector:
             exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = datetime_str.encode('utf-8')
             # Update DateTime (tag 0x0132 / 306)
             exif_dict["0th"][piexif.ImageIFD.DateTime] = datetime_str.encode('utf-8')
-
             exif_bytes = piexif.dump(exif_dict)
 
-            # Save via Pillow to a temp file with exif bytes
-            image = Image.open(photo_path)
-            image.save(temp_path, format=image.format, exif=exif_bytes)
+            # piexif.insert(exif, src, dst) copies src→dst with updated EXIF — no pixel re-encoding
+            piexif.insert(exif_bytes, photo_path, temp_path)
             shutil.move(temp_path, photo_path)
             logger.debug(f"Updated EXIF (piexif) for {photo_path}: {datetime_str}")
             return True
@@ -335,15 +340,22 @@ class MetadataInjector:
             return False
 
     def _update_photo_exif_pillow(self, photo_path: str, datetime_str: str) -> bool:
-        """Fallback EXIF update using Pillow's getexif()/tobytes() when piexif is not available."""
+        """Fallback EXIF update using Pillow's getexif()/tobytes() — handles WebP, TIFF, and
+        JPEG when piexif is unavailable."""
         temp_path = photo_path + '.tmp'
         try:
+            ext = os.path.splitext(photo_path)[1].lower()
             image = Image.open(photo_path)
             exif = image.getexif()
             # Exif tag numbers: 36867 = DateTimeOriginal, 306 = DateTime
             exif[36867] = datetime_str
             exif[306] = datetime_str
-            image.save(temp_path, format=image.format, exif=exif.tobytes())
+            save_kwargs = {"format": image.format, "exif": exif.tobytes()}
+            if ext in ('.jpg', '.jpeg'):
+                # quality='keep' preserves original JPEG compression level (Pillow 9.1+)
+                save_kwargs["quality"] = 'keep'
+            # TIFF is lossless by default; WebP uses Pillow's default quality (acceptable for fallback)
+            image.save(temp_path, **save_kwargs)
             shutil.move(temp_path, photo_path)
             logger.debug(f"Updated EXIF (Pillow) for {photo_path}: {datetime_str}")
             return True
