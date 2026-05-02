@@ -1,206 +1,137 @@
 # Google Photos Metadata Injector
 
-A Python utility that injects photo taken timestamps from Google Photos supplemental metadata JSON files into actual media files (photos and videos). It's a non-destructive batch processor that reads the exported JSON metadata and updates EXIF/container tags in corresponding media files.
+A Python utility that injects metadata from Google Photos supplemental JSON files into exported media files. It processes photos and videos in batch, writing timestamps, GPS coordinates, and file dates back into the actual files — without modifying the originals.
 
 ## Features
 
-✅ **Non-destructive**: Outputs to a separate directory, preserves originals  
-✅ **Handles duplicate filenames**: Matches `image(20).jpeg` with `image.jpeg.supplemental-metadata(20).json`  
-✅ **Flexible JSON naming**: Handles both `.supplemental-metadata.json` and typo variant `.supplemental-metada.json`  
-✅ **Photo formats**:
-- JPEG/TIFF: EXIF DateTimeOriginal and DateTime tags
-- PNG: Text chunks (DateTimeOriginal, CreationTime, GooglePhotosTaken)
-- WebP: EXIF DateTimeOriginal and DateTime tags
-- HEIC: EXIF metadata (with pillow-heif)
-- GIF: Comment field with date/time
-- BMP: Copied without metadata (no standard support)
-✅ **Video support**: Updates container creation_time metadata using ffmpeg  
-✅ **Graceful degradation**: Continues processing if optional tools (ffmpeg, pillow-heif) are unavailable  
-✅ **Unknown timestamps**: Separates files with missing timestamps into an "Unknown Timestamp" folder  
-✅ **Comprehensive logging**: Detailed logs with success/error breakdown by format  
-✅ **Recursive processing**: Handles nested folder structures  
-✅ **Dry-run mode**: Preview what would be processed without modifying anything  
-✅ **Resume support**: `--skip-existing` to skip already-processed files  
-✅ **Progress reporting**: Periodic progress updates during processing  
+- **Non-destructive**: All output goes to a separate directory; originals are never touched
+- **Timestamps**: Sets EXIF `DateTimeOriginal`, container metadata, and OS file timestamps from `photoTakenTime`
+- **GPS coordinates**: Writes GPS EXIF data from `geoDataExif` (preferred) or `geoData`
+- **Broad format support**: JPEG, TIFF, WebP, PNG, HEIC, GIF, BMP, and common video containers
+- **Duplicate filename handling**: Correctly matches `image(20).jpeg` to `image.jpeg.supplemental-metadata(20).json`
+- **Truncated JSON filename handling**: Google Takeout truncates JSON filenames at 51 characters; the script matches them regardless
+- **Unknown timestamps**: Files with no `photoTakenTime` are copied to an `Unknown Timestamp` subfolder
+- **Media without JSON**: Media files with no corresponding JSON are still copied, preserving folder structure
+- **Dry-run mode**: Preview what would be processed without writing any files
+- **Resume support**: Skip already-processed files with `--skip-existing`
+- **Graceful degradation**: Continues processing if optional tools (ffmpeg, pillow-heif) are unavailable
+
+## Requirements
+
+- Python 3.7+
+- ffmpeg (optional — required for video metadata)
+- pillow-heif (optional — required for HEIC/HEIF support)
 
 ## Installation
 
-### Prerequisites
-- Python 3.7+
-- ffmpeg (optional, for video metadata support)
-- pillow-heif (optional, for HEIC/HEIF support)
-
-### Setup
-
-1. Install Python dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-2. (Optional) Install ffmpeg for video metadata support:
-   - **Windows**: Download from https://ffmpeg.org/download.html or use `choco install ffmpeg`
-   - **macOS**: `brew install ffmpeg`
-   - **Linux**: `sudo apt-get install ffmpeg`
+For video metadata support, install ffmpeg separately:
+
+- **Windows**: Download from https://ffmpeg.org/download.html or `choco install ffmpeg`
+- **macOS**: `brew install ffmpeg`
+- **Linux**: `sudo apt-get install ffmpeg`
 
 ## Usage
 
-### Basic usage (current directory as input)
+Run against the current directory, outputting to `./_updated`:
+
 ```bash
 python inject_google_photos_metadata.py
 ```
-Output will go to `./_updated`
 
-### Specify input and output directories
+Specify input and output directories:
+
 ```bash
 python inject_google_photos_metadata.py \
   --input-root "/path/to/Google Photos" \
   --output-root "/path/to/Google Photos Updated"
 ```
 
-### Using environment variables
+Input and output can also be set via environment variables:
+
 ```bash
 export GPHOTOS_INPUT_ROOT="/path/to/Google Photos"
 export GPHOTOS_OUTPUT_ROOT="/path/to/Google Photos Updated"
 python inject_google_photos_metadata.py
 ```
 
-### Custom log file location
-```bash
-python inject_google_photos_metadata.py \
-  --input-root "/path/to/input" \
-  --output-root "/path/to/output" \
-  --log-file "/path/to/logfile.log"
+### Options
+
+| Flag | Description |
+|---|---|
+| `-i`, `--input-root` | Input directory (default: current directory or `GPHOTOS_INPUT_ROOT`) |
+| `-o`, `--output-root` | Output directory (default: `<input>_updated` or `GPHOTOS_OUTPUT_ROOT`) |
+| `--log-file` | Log file path (default: `<output>/metadata_injection.log`) |
+| `--dry-run` | Preview what would be processed without writing any files |
+| `--skip-existing` | Skip files that already exist in the output directory |
+| `-v`, `--verbose` | Show DEBUG-level output on the console |
+
+## How It Works
+
+1. Scans the input directory recursively for supplemental metadata JSON files
+2. Matches each JSON to its corresponding media file (handling duplicates and truncated filenames)
+3. Extracts `photoTakenTime` and GPS data from the JSON
+4. Copies the media file to the output directory and injects metadata based on file type
+5. Sets the output file's OS modification and creation timestamps to the photo taken time
+6. Media files with no matching JSON are copied as-is, preserving folder structure
+7. Writes a detailed log to `<output>/metadata_injection.log`
+
+## Format Support
+
+### JPEG / TIFF / WebP
+- EXIF `DateTimeOriginal` (tag 0x9003) and `DateTime` (tag 0x0132)
+- GPS IFD with latitude, longitude, and altitude
+- JPEG files are updated without re-encoding (uses `piexif.insert`)
+
+### PNG
+- Text chunks: `DateTimeOriginal`, `CreationTime`, `GooglePhotosTaken`
+
+### HEIC / HEIF
+- EXIF `DateTimeOriginal`, `DateTimeDigitized`, `DateTime`, and GPS (requires `pillow-heif`)
+- Copied without metadata if `pillow-heif` is not installed
+
+### GIF
+- Comment field containing `DateTimeOriginal` and `GooglePhotosTaken`
+
+### BMP / Google Pixel Motion Photos (.mp)
+- Copied without metadata (no standard metadata container)
+
+### Videos (MP4, MOV, AVI, MKV, etc.)
+- Container `creation_time` updated via ffmpeg (no re-encoding)
+- Copied without metadata if ffmpeg is not installed
+
+## Output Structure
+
 ```
-
-### Dry run (preview without changes)
-```bash
-python inject_google_photos_metadata.py --dry-run
-```
-
-### Resume an interrupted run
-```bash
-python inject_google_photos_metadata.py --skip-existing
-```
-
-### Verbose output (DEBUG level on console)
-```bash
-python inject_google_photos_metadata.py -v
-```
-
-### Help
-```bash
-python inject_google_photos_metadata.py --help
-```
-
-## How it works
-
-1. Scans the input directory recursively for `.supplemental-metadata.json` files
-2. Matches each JSON file to its corresponding media file (photo or video)
-3. Extracts the `photoTakenTime` timestamp from JSON
-4. Updates the media file's metadata based on file type
-5. Outputs processed files to output directory with folder structure preserved
-6. Generates a detailed log at `{output_root}/metadata_injection.log`
-
-Files with missing timestamps are copied to an `Unknown Timestamp` subfolder without metadata updates.
-
-## Input/Output
-
-- **Input**: Directory containing photo subdirectories with both media files and `.supplemental-metadata.json` files
-- **Output**: Identical folder structure in output directory with updated media files
-- **Log**: `{output_root}/metadata_injection.log` - detailed processing report
-
-### Example
-
-```
-Input structure:
+Input:
   Photos from 2014/
-    ├── image(20).jpeg
-    └── image.jpeg.supplemental-metadata(20).json
+    image.jpeg
+    image.jpeg.supplemental-metadata.json
+    image(1).jpeg
+    image.jpeg.supplemental-metadata(1).json
 
-Output structure:
+Output:
   Photos from 2014/
-    └── image(20).jpeg  (with DateTimeOriginal updated from JSON)
+    image.jpeg               <- metadata updated
+    image(1).jpeg            <- metadata updated
+  Unknown Timestamp/         <- files with no photoTakenTime
   metadata_injection.log
-  Unknown Timestamp/  (if any files had missing timestamps)
 ```
-
-## Metadata Fields Updated
-
-### JPEG/TIFF/WebP Photos
-- **EXIF DateTimeOriginal** (tag 0x9003): When the photo was taken
-- **EXIF DateTime** (tag 0x0132): Secondary timestamp for compatibility
-
-### PNG Photos
-- **Text chunks**: DateTimeOriginal, CreationTime, GooglePhotosTaken
-- View with: image viewers supporting PNG metadata or `pngcheck -t <file>`
-
-### HEIC Photos
-- **EXIF DateTimeOriginal, DateTimeDigitized, DateTime**: When pillow-heif is available
-- Files are copied without metadata if pillow-heif is not installed
-
-### GIF Photos
-- **Comment field**: Contains DateTimeOriginal and GooglePhotosTaken
-- View with: `gifsicle --info <file>` or image viewers
-
-### Videos
-- **creation_time**: Container-level metadata timestamp (when ffmpeg is available)
-- Files are copied without metadata if ffmpeg is not installed
 
 ## Logging
 
-### Log Output
-- **Console**: INFO level and above (progress, warnings, errors)
-- **Log file**: DEBUG level and above (detailed processing info)
+- **Console**: INFO level by default; DEBUG with `-v`
+- **Log file**: Always DEBUG level — full detail on every file processed
 
-### Summary
-Each run produces a summary showing:
-- Total processed files
-- Skipped files
-- Errors encountered
-- Success counts by format (JPEG/TIFF, PNG, HEIC, GIF, videos)
-- Files copied without metadata
-- Files with unknown timestamps
-
-### Troubleshooting
-Check the log file for:
-- Why specific files were skipped
-- Detailed error messages with file paths
-- Format-specific metadata update failures
-
-## Performance
-
-Processing time depends on:
-- Number of files (metadata reading is fast)
-- File sizes (especially videos - no re-encoding, just metadata copy)
-- Disk I/O speed
-
-Reference: ~60 photos/videos typically processes in 5-10 minutes.
-
-## Safety
-
-✅ **Non-destructive**: Original files are never modified
-✅ **Safe to run multiple times**: Output directory is created fresh each time
-✅ **Comprehensive error handling**: Errors on individual files don't stop processing
-
-## Optional Dependencies
-
-The script gracefully handles missing optional dependencies:
-
-- **piexif**: Better EXIF support. If missing, falls back to Pillow's basic EXIF
-- **ffmpeg**: Required for video metadata. If missing, videos are copied without metadata
-- **pillow-heif**: Required for HEIC support. If missing, HEIC files are copied without metadata
-
-Install these dependencies for full functionality:
-```bash
-pip install piexif pillow-heif
-```
+Each run ends with a summary showing counts by format (JPEG/TIFF, PNG, HEIC, GIF, video), files copied without metadata, unknown timestamps, GPS injections, and any errors.
 
 ## Testing
 
-Run the test suite with pytest:
 ```bash
-pip install pytest
 python -m pytest tests/ -v
 ```
 
-Tests cover metadata parsing, format-specific handlers (JPEG, PNG, GIF, WebP), extension constants, and end-to-end integration scenarios including dry-run and skip-existing modes.
+Tests cover metadata parsing, format handlers (JPEG, PNG, GIF, WebP), GPS injection, file timestamp setting, extension constants, and end-to-end scenarios including dry-run and skip-existing modes.
